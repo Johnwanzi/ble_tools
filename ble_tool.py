@@ -646,6 +646,16 @@ class BLEToolWindow(QMainWindow):
         self.btn_connect.setEnabled(False)
 
         async def _connect():
+            # Stop scanner first: concurrent scanning and GATT service
+            # discovery on Windows WinRT share the radio and cause incomplete
+            # service enumeration on reconnect.
+            if self._scanner:
+                try:
+                    await self._scanner.stop()
+                except Exception:
+                    pass
+                self._scanner = None
+
             try:
                 def _disconnected_cb(client: BleakClient):
                     # Guard: ignore stale callbacks from a previously disconnected
@@ -666,7 +676,6 @@ class BLEToolWindow(QMainWindow):
                 await self._client.connect()
                 self._connected_address = address
                 self.connection_done.emit(True, f"Connected to {name} ({address})")
-                # In bleak 3.x services are discovered automatically during connect()
                 services = self._client.services
                 self.services_discovered.emit(services)
             except Exception as e:
@@ -1049,6 +1058,9 @@ class BLEToolWindow(QMainWindow):
     def _reset_connection_ui(self):
         """Reset all UI state to disconnected. Safe to call from any context."""
         self.lbl_conn.setText("Not connected")
+        # Sync scan button in case the scanner was stopped internally during connect
+        if not self._scanning:
+            self.btn_scan.setText("Start Scan")
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
         self.btn_pair.setEnabled(False)
@@ -1077,6 +1089,9 @@ class BLEToolWindow(QMainWindow):
         self._client = None
         self._connected_address = None
         self._reset_connection_ui()
+        # Keep Connect disabled until the old client is fully closed so a
+        # new connect() does not race with the ongoing disconnect.
+        self.btn_connect.setEnabled(False)
 
         async def _disconnect():
             try:
@@ -1084,6 +1099,7 @@ class BLEToolWindow(QMainWindow):
             except Exception:
                 pass
             self.log_signal.emit("Disconnected.")
+            QTimer.singleShot(0, lambda: self.btn_connect.setEnabled(True))
 
         self._async.run(_disconnect())
 
