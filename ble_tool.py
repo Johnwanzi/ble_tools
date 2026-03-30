@@ -164,6 +164,7 @@ class BLEToolWindow(QMainWindow):
     device_found = pyqtSignal(object, object)  # BLEDevice, AdvertisementData
     log_signal = pyqtSignal(str)
     connection_done = pyqtSignal(bool, str)  # success, message
+    disconnected_signal = pyqtSignal(str)   # reason string (unexpected disconnect)
     services_discovered = pyqtSignal(object)  # list of BleakGATTService
     char_value_read = pyqtSignal(str, object)  # uuid, bytes value
     char_notify_received = pyqtSignal(str, object)  # uuid, bytes value
@@ -186,6 +187,7 @@ class BLEToolWindow(QMainWindow):
         self._init_ui()
         self._connect_signals()
         self._setup_pairing_agent()
+        self.disconnected_signal.connect(self._on_unexpected_disconnect)
 
     # ---- UI setup ---------------------------------------------------------
 
@@ -377,7 +379,8 @@ class BLEToolWindow(QMainWindow):
             except Exception as e:
                 self.log_signal.emit(f"Scan error: {e}")
                 self._scanning = False
-                self.btn_scan.setText("Start Scan")
+                # Use QTimer to update UI safely from async context
+                QTimer.singleShot(0, lambda: self.btn_scan.setText("Start Scan"))
 
         self._async.run(_scan())
 
@@ -452,9 +455,12 @@ class BLEToolWindow(QMainWindow):
         self._log(f"Connecting to {name} ({address})...")
         self.btn_connect.setEnabled(False)
 
+        def _disconnected_cb(client: BleakClient):
+            self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
+
         async def _connect():
             try:
-                self._client = BleakClient(address)
+                self._client = BleakClient(address, disconnected_callback=_disconnected_cb)
                 await self._client.connect()
                 self._connected_address = address
                 self.connection_done.emit(True, f"Connected to {name} ({address})")
@@ -468,12 +474,14 @@ class BLEToolWindow(QMainWindow):
 
     def _on_connection_done(self, success: bool, msg: str):
         self._log(msg)
-        self.btn_connect.setEnabled(True)
-        if success and "Disconnected" not in msg:
+        if success:
             self.lbl_conn.setText(msg)
+            self.btn_connect.setEnabled(False)   # keep disabled while connected
             self.btn_disconnect.setEnabled(True)
             if HAS_DBUS:
                 self.btn_pair.setEnabled(True)
+        else:
+            self.btn_connect.setEnabled(True)    # re-enable only on failure
 
     def _on_services_discovered(self, services):
         """Populate the service tree with discovered GATT services."""
@@ -717,22 +725,10 @@ class BLEToolWindow(QMainWindow):
 
         self._async.run(_pair())
 
-    def _on_disconnect(self):
-        if not self._client:
-            return
-        self._log("Disconnecting...")
-
-        async def _disconnect():
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            self._connected_address = None
-            self.connection_done.emit(True, "Disconnected")
-
-        self._async.run(_disconnect())
+    def _reset_connection_ui(self):
+        """Reset all UI state to disconnected. Safe to call from any context."""
         self.lbl_conn.setText("Not connected")
+        self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
         self.btn_pair.setEnabled(False)
         self.service_tree.clear()
@@ -741,6 +737,31 @@ class BLEToolWindow(QMainWindow):
         self.btn_write.setEnabled(False)
         self.btn_notify.setEnabled(False)
         self.btn_indicate.setEnabled(False)
+
+    def _on_unexpected_disconnect(self, reason: str):
+        """Handle device-initiated disconnect (via disconnected_callback)."""
+        self._log(f"[!] {reason}")
+        self._client = None
+        self._connected_address = None
+        self._reset_connection_ui()
+
+    def _on_disconnect(self):
+        if not self._client:
+            return
+        self._log("Disconnecting...")
+        client = self._client
+        self._client = None
+        self._connected_address = None
+        self._reset_connection_ui()
+
+        async def _disconnect():
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            self.log_signal.emit("Disconnected.")
+
+        self._async.run(_disconnect())
 
     # ---- Pairing Agent (Linux only) --------------------------------------------
 
