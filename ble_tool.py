@@ -41,25 +41,19 @@ else:
 # Async helper – run coroutines from Qt without qasync
 # ---------------------------------------------------------------------------
 class AsyncBridge(QObject):
-    """Runs an asyncio event loop in the background, driven by a QTimer."""
+    """Runs an asyncio event loop continuously in a dedicated background thread."""
 
     def __init__(self):
         super().__init__()
         self._loop = asyncio.new_event_loop()
-        self._timer = QTimer()
-        self._timer.setInterval(10)
-        self._timer.timeout.connect(self._step)
-        self._timer.start()
-
-    def _step(self):
-        self._loop.stop()
-        self._loop.run_forever()
+        import threading
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
 
     def run(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def stop(self):
-        self._timer.stop()
         self._loop.call_soon_threadsafe(self._loop.stop)
 
 
