@@ -437,19 +437,13 @@ class BLEToolWindow(QMainWindow):
         ping_group = QGroupBox("Ping (Proto V0)")
         ping_layout = QVBoxLayout(ping_group)
 
-        uuid_grid = QHBoxLayout()
-        uuid_grid.addWidget(QLabel("TX UUID:"))
-        self.ping_tx_uuid = QLineEdit()
-        self.ping_tx_uuid.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-        uuid_grid.addWidget(self.ping_tx_uuid)
-        ping_layout.addLayout(uuid_grid)
-
-        uuid_grid2 = QHBoxLayout()
-        uuid_grid2.addWidget(QLabel("RX UUID:"))
-        self.ping_rx_uuid = QLineEdit()
-        self.ping_rx_uuid.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-        uuid_grid2.addWidget(self.ping_rx_uuid)
-        ping_layout.addLayout(uuid_grid2)
+        char_bar = QHBoxLayout()
+        char_bar.addWidget(QLabel("Write Char:"))
+        self.ping_char_combo = QComboBox()
+        self.ping_char_combo.setPlaceholderText("Connect and discover services first")
+        self.ping_char_combo.setMinimumWidth(200)
+        char_bar.addWidget(self.ping_char_combo, 1)
+        ping_layout.addLayout(char_bar)
 
         msg_bar = QHBoxLayout()
         msg_bar.addWidget(QLabel("Message:"))
@@ -722,6 +716,25 @@ class BLEToolWindow(QMainWindow):
 
         self.service_tree.expandAll()
 
+        # Populate ping char combo with all writable characteristics
+        self.ping_char_combo.clear()
+        for service in services:
+            for char in service.characteristics:
+                props = char.properties  # list[str]
+                if "write" in props or "write-without-response" in props:
+                    label = char.uuid
+                    if char.description:
+                        label = f"{char.description}  ({char.uuid})"
+                    props_note = []
+                    if "write" in props:
+                        props_note.append("write")
+                    if "write-without-response" in props:
+                        props_note.append("write-no-resp")
+                    if "notify" in props:
+                        props_note.append("notify")
+                    label += f"  [{', '.join(props_note)}]"
+                    self.ping_char_combo.addItem(label, char.uuid)
+
     # ---- Characteristic Operations ------------------------------------------
 
     def _get_selected_char(self):
@@ -901,17 +914,24 @@ class BLEToolWindow(QMainWindow):
             self._log("Ping: not connected.")
             return
 
-        tx_uuid = self.ping_tx_uuid.text().strip()
-        rx_uuid = self.ping_rx_uuid.text().strip()
-        if not tx_uuid or not rx_uuid:
-            self._log("Ping: TX UUID and RX UUID are required.")
+        uuid = self.ping_char_combo.currentData()
+        if not uuid:
+            self._log("Ping: no write characteristic selected.")
             return
+
+        # Determine if this characteristic also supports notify
+        has_notify = False
+        for svc in self._client.services:
+            for char in svc.characteristics:
+                if char.uuid == uuid:
+                    has_notify = "notify" in char.properties
+                    break
 
         message = self.ping_message.text()
         pb_payload = pb_encode_ping(message)
         frame = build_pb_frame(_PB_MSG_TYPE_PING, pb_payload, router=1)
 
-        self._log(f"Ping TX ({len(frame)}B): {frame.hex(' ')}")
+        self._log(f"Ping TX → {uuid}  ({len(frame)}B): {frame.hex(' ')}")
         self.lbl_ping_result.setText("Waiting for response…")
         self.btn_ping.setEnabled(False)
 
@@ -924,8 +944,15 @@ class BLEToolWindow(QMainWindow):
                 loop.call_soon_threadsafe(response_queue.put_nowait, bytes(data))
 
             try:
-                await self._client.start_notify(rx_uuid, _notify_cb)
-                await self._client.write_gatt_char(tx_uuid, frame, response=False)
+                if has_notify:
+                    await self._client.start_notify(uuid, _notify_cb)
+
+                await self._client.write_gatt_char(uuid, frame, response=False)
+
+                if not has_notify:
+                    self.log_signal.emit("Ping sent (characteristic has no notify — response skipped).")
+                    self.ping_result_signal.emit(True, "Sent (no notify)")
+                    return
 
                 try:
                     rx_data = await asyncio.wait_for(response_queue.get(), timeout=5.0)
@@ -949,27 +976,28 @@ class BLEToolWindow(QMainWindow):
                     return
 
                 msg_type, pb = parsed
-                name = _PB_MSG_NAMES.get(msg_type, f"Unknown({msg_type})")
+                msg_name = _PB_MSG_NAMES.get(msg_type, f"Unknown({msg_type})")
                 if msg_type == _PB_MSG_TYPE_SUCCESS:
                     decoded = pb_decode_success(pb)
-                    self.log_signal.emit(f"Ping OK  msg_type={msg_type} ({name})  response=\"{decoded}\"")
+                    self.log_signal.emit(f"Ping OK  msg_type={msg_type} ({msg_name})  response=\"{decoded}\"")
                     self.ping_result_signal.emit(True, f"Success: \"{decoded}\"")
                 elif msg_type == _PB_MSG_TYPE_FAILURE:
                     code, decoded = pb_decode_failure(pb)
-                    self.log_signal.emit(f"Ping FAIL  msg_type={msg_type} ({name})  code={code}  \"{decoded}\"")
+                    self.log_signal.emit(f"Ping FAIL  msg_type={msg_type} ({msg_name})  code={code}  \"{decoded}\"")
                     self.ping_result_signal.emit(False, f"Failure code={code}: \"{decoded}\"")
                 else:
-                    self.log_signal.emit(f"Ping unexpected msg_type={msg_type} ({name})")
-                    self.ping_result_signal.emit(False, f"Unexpected msg_type={msg_type} ({name})")
+                    self.log_signal.emit(f"Ping unexpected msg_type={msg_type} ({msg_name})")
+                    self.ping_result_signal.emit(False, f"Unexpected msg_type={msg_type} ({msg_name})")
 
             except Exception as exc:
                 self.log_signal.emit(f"Ping error: {exc}")
                 self.ping_result_signal.emit(False, f"Error: {exc}")
             finally:
-                try:
-                    await self._client.stop_notify(rx_uuid)
-                except Exception:
-                    pass
+                if has_notify:
+                    try:
+                        await self._client.stop_notify(uuid)
+                    except Exception:
+                        pass
                 QTimer.singleShot(0, lambda: self.btn_ping.setEnabled(True))
 
         self._async.run(_ping())
@@ -1012,6 +1040,7 @@ class BLEToolWindow(QMainWindow):
         self.btn_pair.setEnabled(False)
         self.btn_ping.setEnabled(False)
         self.lbl_ping_result.setText("")
+        self.ping_char_combo.clear()
         self.service_tree.clear()
         self._notifying.clear()
         self.btn_read.setEnabled(False)
