@@ -47,7 +47,10 @@ class AsyncBridge(QObject):
         super().__init__()
         self._loop = asyncio.new_event_loop()
         import threading
-        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        def _run():
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_forever()
+        self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
 
     def run(self, coro):
@@ -650,8 +653,8 @@ class BLEToolWindow(QMainWindow):
                 await self._client.connect()
                 self._connected_address = address
                 self.connection_done.emit(True, f"Connected to {name} ({address})")
-                # Explicitly discover services every time (avoids stale cache on reconnect)
-                services = await self._client.get_services()
+                # In bleak 3.x services are discovered automatically during connect()
+                services = self._client.services
                 self.services_discovered.emit(services)
             except Exception as e:
                 self.connection_done.emit(False, f"Connection failed: {e}")
