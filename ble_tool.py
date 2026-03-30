@@ -1213,7 +1213,8 @@ class BLEToolWindow(QMainWindow):
 
     def _on_fw_browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select file to upload", "", "All Files (*)")
+            self, "Select file to upload", "", "All Files (*)",
+            options=QFileDialog.DontUseNativeDialog)
         if not path:
             return
         from pathlib import Path
@@ -1223,7 +1224,8 @@ class BLEToolWindow(QMainWindow):
             self._log(f"File read error: {e}")
             return
         self._fw_file_data = data
-        self.fw_file_label.setText(f"{Path(path).name}  ({len(data):,} B)")
+        # Show full path + size
+        self.fw_file_label.setText(f"{path}  ({len(data):,} B)")
         self.fw_file_label.setStyleSheet("color: #eee;")
 
     def _on_fw_abort(self):
