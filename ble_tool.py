@@ -622,8 +622,9 @@ class BLEToolWindow(QMainWindow):
         fw_chunk_bar = QHBoxLayout()
         fw_chunk_bar.addWidget(QLabel("Chunk size:"))
         self.fw_chunk_spin = QSpinBox()
-        self.fw_chunk_spin.setRange(64, 512)
-        self.fw_chunk_spin.setValue(128)
+        self.fw_chunk_spin.setRange(512, 4096)
+        self.fw_chunk_spin.setSingleStep(512)
+        self.fw_chunk_spin.setValue(512)
         self.fw_chunk_spin.setSuffix(" B")
         fw_chunk_bar.addWidget(self.fw_chunk_spin)
         fw_chunk_bar.addStretch()
@@ -656,8 +657,9 @@ class BLEToolWindow(QMainWindow):
         fr_chunk_bar = QHBoxLayout()
         fr_chunk_bar.addWidget(QLabel("Chunk size:"))
         self.fr_chunk_spin = QSpinBox()
-        self.fr_chunk_spin.setRange(64, 512)
-        self.fr_chunk_spin.setValue(128)
+        self.fr_chunk_spin.setRange(512, 4096)
+        self.fr_chunk_spin.setSingleStep(512)
+        self.fr_chunk_spin.setValue(512)
         self.fr_chunk_spin.setSuffix(" B")
         fr_chunk_bar.addWidget(self.fr_chunk_spin)
         fr_chunk_bar.addStretch()
@@ -1253,14 +1255,19 @@ class BLEToolWindow(QMainWindow):
     # ---- Upload (Write) -----------------------------------------------------
 
     def _on_fw_browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select file to upload")
-        if path:
-            import os
-            self._fw_file_data = open(path, "rb").read()
-            size = len(self._fw_file_data)
-            name = os.path.basename(path)
-            self.fw_file_label.setText(f"{name}  ({size:,} B)")
-            self.fw_file_label.setStyleSheet("color: #eee;")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select file to upload", "", "All Files (*)")
+        if not path:
+            return
+        from pathlib import Path
+        try:
+            data = Path(path).read_bytes()
+        except Exception as e:
+            self._log(f"File read error: {e}")
+            return
+        self._fw_file_data = data
+        self.fw_file_label.setText(f"{Path(path).name}  ({len(data):,} B)")
+        self.fw_file_label.setStyleSheet("color: #eee;")
 
     def _on_fw_abort(self):
         self._fw_abort = True
