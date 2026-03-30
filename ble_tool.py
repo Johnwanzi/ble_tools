@@ -382,7 +382,7 @@ class BLEToolWindow(QMainWindow):
         rssi_bar.addWidget(QLabel("RSSI ≥"))
         self.rssi_filter = QSpinBox()
         self.rssi_filter.setRange(-120, 0)
-        self.rssi_filter.setValue(-100)
+        self.rssi_filter.setValue(-60)
         self.rssi_filter.setSuffix(" dBm")
         self.rssi_filter.setToolTip("Only show devices with RSSI above this threshold")
         rssi_bar.addWidget(self.rssi_filter)
