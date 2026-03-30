@@ -659,6 +659,10 @@ class BLEToolWindow(QMainWindow):
                     disconnected_callback=_disconnected_cb,
                     winrt={"use_cached_services": False},
                 )
+                # On Windows reconnect the GATT stack fires services_changed
+                # events while re-enumerating; enable retry so bleak loops
+                # until the list stabilises before returning.
+                self._client._retry_on_services_changed = True
                 await self._client.connect()
                 self._connected_address = address
                 self.connection_done.emit(True, f"Connected to {name} ({address})")
