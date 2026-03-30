@@ -601,13 +601,20 @@ class BLEToolWindow(QMainWindow):
         fio_layout.addWidget(write_lbl)
 
         fw_file_bar = QHBoxLayout()
-        self.fw_file_label = QLabel("No file selected")
-        self.fw_file_label.setStyleSheet("color: #aaa;")
-        fw_file_bar.addWidget(self.fw_file_label, 1)
         self.btn_fw_browse = QPushButton("Browse...")
         self.btn_fw_browse.setMinimumHeight(28)
         fw_file_bar.addWidget(self.btn_fw_browse)
+        fw_file_bar.addStretch()
         fio_layout.addLayout(fw_file_bar)
+
+        self.fw_file_info = QTextEdit()
+        self.fw_file_info.setReadOnly(True)
+        self.fw_file_info.setFixedHeight(60)
+        self.fw_file_info.setPlaceholderText("No file selected")
+        self.fw_file_info.setStyleSheet(
+            "QTextEdit { background: #1a1a1a; color: #aaa; "
+            "border: 1px solid #444; border-radius: 4px; font-family: monospace; }")
+        fio_layout.addWidget(self.fw_file_info)
 
         fw_chunk_bar = QHBoxLayout()
         fw_chunk_bar.addWidget(QLabel("Chunk size:"))
@@ -1233,9 +1240,16 @@ class BLEToolWindow(QMainWindow):
             self._log(f"File read error: {e}")
             return
         self._fw_file_data = data
-        # Show full path + size
-        self.fw_file_label.setText(f"{path}  ({len(data):,} B)")
-        self.fw_file_label.setStyleSheet("color: #eee;")
+        from pathlib import Path as _Path
+        p = _Path(path)
+        self.fw_file_info.setStyleSheet(
+            "QTextEdit { background: #1a1a1a; color: #00d4aa; "
+            "border: 1px solid #00d4aa; border-radius: 4px; font-family: monospace; }")
+        self.fw_file_info.setPlainText(
+            f"Name : {p.name}\n"
+            f"Path : {p.parent}\n"
+            f"Size : {len(data):,} B  ({len(data)/1024:.1f} KB)"
+        )
 
     def _on_fw_abort(self):
         self._fw_abort = True
@@ -1379,6 +1393,7 @@ class BLEToolWindow(QMainWindow):
         self.btn_fw_send.setEnabled(False)
         self.fw_progress.setVisible(False)
         self.lbl_fw_status.setText("")
+        self.fw_file_info.clear()
         self.service_tree.clear()
         self._notifying.clear()
         self.btn_read.setEnabled(False)
