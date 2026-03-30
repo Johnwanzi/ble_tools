@@ -826,13 +826,22 @@ class BLEToolWindow(QMainWindow):
                 self._client._retry_on_services_changed = True
                 await self._client.connect()
                 self._connected_address = address
-                self.connection_done.emit(True, f"Connected to {name} ({address})")
+                mtu = self._client.mtu_size
+                self.connection_done.emit(True, f"Connected to {name} ({address})  MTU={mtu}")
                 services = self._client.services
                 self.services_discovered.emit(services)
+                # Update chunk size to device MTU minus ATT overhead (3 bytes)
+                payload = max(mtu - 3, 20)
+                self.log_signal.emit(f"MTU negotiated: {mtu}  usable payload: {payload} B")
+                QTimer.singleShot(0, lambda: self._apply_mtu(payload))
             except Exception as e:
                 self.connection_done.emit(False, f"Connection failed: {e}")
 
         self._async.run(_connect())
+
+    def _apply_mtu(self, payload: int):
+        """Set chunk size spinboxes to the negotiated MTU payload size."""
+        self.fw_chunk_spin.setValue(payload)
 
     def _on_connection_done(self, success: bool, msg: str):
         self._log(msg)
