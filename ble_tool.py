@@ -23,6 +23,7 @@ from bleak.backends.scanner import AdvertisementData
 
 # Check if we're on Linux for dbus support
 IS_LINUX = platform.system() == 'Linux'
+IS_WINDOWS = platform.system() == 'Windows'
 
 if IS_LINUX:
     try:
@@ -35,6 +36,19 @@ if IS_LINUX:
         print("Warning: dbus not available. Pairing features disabled.")
 else:
     HAS_DBUS = False
+
+# Check for WinRT pairing support (Windows only)
+HAS_WINRT = False
+if IS_WINDOWS:
+    try:
+        from winrt.windows.devices.bluetooth import BluetoothLEDevice
+        from winrt.windows.devices.enumeration import (
+            DevicePairingKinds, DevicePairingResultStatus,
+        )
+        HAS_WINRT = True
+    except ImportError:
+        print("Info: winrt not available. Windows pairing via tool disabled.")
+        print("      Install with: pip install winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Enumeration")
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +279,8 @@ class BLEToolWindow(QMainWindow):
         self.btn_pair.setMinimumHeight(36)
         self.btn_pair.setEnabled(False)
 
-        # Disable pairing on Windows
-        if not HAS_DBUS:
-            self.btn_pair.setToolTip("Pairing not supported on Windows")
+        if not HAS_DBUS and not HAS_WINRT:
+            self.btn_pair.setToolTip("Pairing not supported (install winrt on Windows)")
 
         conn_btns.addWidget(self.btn_connect)
         conn_btns.addWidget(self.btn_disconnect)
@@ -472,7 +485,7 @@ class BLEToolWindow(QMainWindow):
         if success and "Disconnected" not in msg:
             self.lbl_conn.setText(msg)
             self.btn_disconnect.setEnabled(True)
-            if HAS_DBUS:
+            if HAS_DBUS or HAS_WINRT:
                 self.btn_pair.setEnabled(True)
 
     def _on_services_discovered(self, services):
@@ -692,30 +705,109 @@ class BLEToolWindow(QMainWindow):
                     return
 
     def _on_pair(self):
-        """Initiate pairing (Linux only)."""
-        if not HAS_DBUS:
-            self._log("Pairing is not supported on Windows. Use Windows Bluetooth settings.")
-            QMessageBox.information(self, "Pairing",
-                "Pairing is not supported directly on Windows.\n\n"
-                "Please use Windows Bluetooth settings to pair devices:\n"
-                "1. Open Windows Settings > Bluetooth & devices\n"
-                "2. Click 'Add device'\n"
-                "3. Select your BLE device from the list")
-            return
-
+        """Initiate pairing — WinRT on Windows, BlueZ on Linux."""
         if not self._client or not self._connected_address:
             self._log("Not connected.")
             return
-        self._log("Initiating pairing...")
 
-        async def _pair():
+        if IS_WINDOWS:
+            if not HAS_WINRT:
+                self._log("winrt not installed — cannot pair from this tool.")
+                QMessageBox.information(self, "Pairing",
+                    "WinRT package is required for pairing on Windows.\n\n"
+                    "Install it with:\n"
+                    "  pip install winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Enumeration\n\n"
+                    "Or use Windows Settings > Bluetooth & devices to pair manually.")
+                return
+            self._log("Initiating WinRT pairing...")
+            self._async.run(self._pair_windows(self._connected_address))
+        else:
+            if not HAS_DBUS:
+                self._log("dbus not available — cannot pair.")
+                return
+            self._log("Initiating pairing...")
+
+            async def _pair():
+                try:
+                    await self._client.pair()
+                    self.log_signal.emit("Pairing successful!")
+                except Exception as e:
+                    self.log_signal.emit(f"Pairing failed: {e}")
+
+            self._async.run(_pair())
+
+    async def _pair_windows(self, address: str):
+        """Windows pairing via WinRT custom pairing (supports numerical comparison)."""
+        try:
+            from winrt.windows.devices.bluetooth import BluetoothLEDevice
+            from winrt.windows.devices.enumeration import (
+                DevicePairingKinds, DevicePairingResultStatus,
+            )
+
+            addr_int = int(address.replace(':', ''), 16)
+            ble_device = await BluetoothLEDevice.from_bluetooth_address_async(addr_int)
+            if not ble_device:
+                self.log_signal.emit("Pairing: could not get device info from address")
+                return
+
+            pairing = ble_device.device_information.pairing
+            if pairing.is_paired:
+                self.log_signal.emit("Device is already paired")
+                return
+
+            custom = pairing.custom
+            token = custom.add_pairing_requested(self._on_winrt_pairing_requested)
             try:
-                await self._client.pair()
-                self.log_signal.emit("Pairing successful!")
-            except Exception as e:
-                self.log_signal.emit(f"Pairing failed: {e}")
+                kinds = (DevicePairingKinds.CONFIRM_PIN_MATCH |
+                         DevicePairingKinds.CONFIRM_ONLY |
+                         DevicePairingKinds.JUST_WORKS)
+                result = await custom.pair_async(kinds)
+                status_name = result.status.name if hasattr(result.status, 'name') else str(result.status)
+                if result.status == DevicePairingResultStatus.PAIRED:
+                    self.log_signal.emit("Pairing successful!")
+                elif result.status == DevicePairingResultStatus.ALREADY_PAIRED:
+                    self.log_signal.emit("Device is already paired")
+                else:
+                    self.log_signal.emit(f"Pairing failed: {status_name}")
+            finally:
+                custom.remove_pairing_requested(token)
+                ble_device.close()
 
-        self._async.run(_pair())
+        except Exception as e:
+            self.log_signal.emit(f"Pairing error: {e}")
+
+    def _on_winrt_pairing_requested(self, sender, args):
+        """WinRT pairing_requested callback — runs on a WinRT thread pool thread."""
+        import time
+        from winrt.windows.devices.enumeration import DevicePairingKinds
+
+        kind = args.pairing_kind
+        if kind == DevicePairingKinds.JUST_WORKS:
+            args.accept()
+            return
+
+        pin_str = args.pin if args.pin else ""
+        pin_int = int(pin_str) if pin_str.isdigit() else 0
+
+        if kind == DevicePairingKinds.CONFIRM_ONLY:
+            mode = "confirm_only"
+        else:  # CONFIRM_PIN_MATCH
+            mode = "confirm_pin"
+
+        self._pairing_result = None
+        self.pairing_request.emit("", pin_int, mode)
+
+        # Block this WinRT thread until the Qt dialog responds (max 60 s)
+        for _ in range(600):
+            if self._pairing_result is not None:
+                break
+            time.sleep(0.1)
+
+        if self._pairing_result:
+            if kind == DevicePairingKinds.CONFIRM_PIN_MATCH and pin_str:
+                args.accept(pin_str)
+            else:
+                args.accept()
 
     def _on_disconnect(self):
         if not self._client:
@@ -745,19 +837,26 @@ class BLEToolWindow(QMainWindow):
     # ---- Pairing Agent (Linux only) --------------------------------------------
 
     def _setup_pairing_agent(self):
-        """Register the BlueZ pairing agent for numerical comparison (Linux only)."""
+        """Register pairing agent — BlueZ on Linux, WinRT on Windows."""
+        self.pairing_request.connect(self._show_pairing_dialog)
+
+        if IS_WINDOWS:
+            if HAS_WINRT:
+                self._log("Windows WinRT pairing ready (numerical comparison supported)")
+            else:
+                self._log("Windows: winrt not installed — pairing via tool disabled")
+            return
+
         if not HAS_DBUS:
-            self._log(f"Platform: {platform.system()} - Pairing via tool not supported")
+            self._log(f"Platform: {platform.system()} — pairing not supported")
             return
 
         self._agent = register_pairing_agent()
         if self._agent:
             self._agent.confirm_request_callback = self._handle_pairing_request
-            self._log("Pairing agent registered (numerical comparison supported)")
+            self._log("BlueZ pairing agent registered (numerical comparison supported)")
         else:
             self._log("Pairing agent not available (run with appropriate permissions)")
-
-        self.pairing_request.connect(self._show_pairing_dialog)
 
     def _handle_pairing_request(self, device_path, passkey, mode):
         """Called from D-Bus thread — emit signal for thread-safe UI dialog."""
@@ -790,29 +889,48 @@ class BLEToolWindow(QMainWindow):
         return self._pairing_result or False
 
     def _show_pairing_dialog(self, device_path: str, passkey: int, mode: str):
-        """Show a dialog asking the user to confirm numerical comparison."""
-        device_name = device_path.split("/")[-1] if "/" in device_path else device_path
+        """Show a dialog asking the user to confirm pairing (all platforms)."""
+        device_name = device_path.split("/")[-1] if "/" in device_path else (device_path or "device")
 
-        if mode == "confirm":
+        if mode in ("confirm", "confirm_pin"):
+            # Numerical comparison — show the PIN and ask user to confirm
+            pin_display = f"{passkey:06d}" if passkey else "------"
             msg = (
-                f"Pairing request from:\n{device_name}\n\n"
-                f"Confirm passkey matches:\n\n"
-                f"  {passkey:06d}\n\n"
-                f"Does this number match the one shown on the device?"
+                f"Pairing request{(' from: ' + device_name) if device_name and device_name != 'device' else ''}.\n\n"
+                f"Confirm the passkey matches the one shown on the device:\n\n"
+                f"        {pin_display}\n\n"
+                f"Does this number match?"
             )
             reply = QMessageBox.question(
-                self, "Numerical Comparison - Pairing",
+                self, "Numerical Comparison — Pairing",
                 msg,
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
             )
             self._pairing_result = (reply == QMessageBox.Yes)
             if self._pairing_result:
-                self._log(f"Pairing confirmed for {device_name} (passkey: {passkey:06d})")
+                self._log(f"Pairing confirmed (passkey: {pin_display})")
             else:
-                self._log(f"Pairing rejected for {device_name}")
+                self._log("Pairing rejected by user")
+
+        elif mode == "confirm_only":
+            # Just ask user to accept/reject, no PIN to compare
+            msg = (
+                f"Pairing request{(' from: ' + device_name) if device_name and device_name != 'device' else ''}.\n\n"
+                f"Accept pairing?"
+            )
+            reply = QMessageBox.question(
+                self, "Pairing Request",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            self._pairing_result = (reply == QMessageBox.Yes)
+            self._log(f"Pairing {'accepted' if self._pairing_result else 'rejected'}")
+
         elif mode == "display":
-            self._log(f"Display passkey: {passkey:06d} for {device_name}")
+            pin_display = f"{passkey:06d}" if passkey else "------"
+            self._log(f"Display passkey: {pin_display}" + (f" for {device_name}" if device_name and device_name != 'device' else ""))
             self._pairing_result = True
 
     # ---- Cleanup ----------------------------------------------------------

@@ -1,2 +1,6 @@
 PyQt5>=5.15.0
 bleak>=0.21.0
+
+# Windows only — enables in-tool BLE pairing with numerical comparison
+# winrt-Windows.Devices.Bluetooth>=2.0
+# winrt-Windows.Devices.Enumeration>=2.0
