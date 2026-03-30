@@ -591,7 +591,7 @@ class BLEToolWindow(QMainWindow):
         # Device path
         path_bar = QHBoxLayout()
         path_bar.addWidget(QLabel("Device path:"))
-        self.fio_device_path = QLineEdit("vol1:test.bin")
+        self.fio_device_path = QLineEdit("vol0:test.bin")
         path_bar.addWidget(self.fio_device_path, 1)
         fio_layout.addLayout(path_bar)
 
