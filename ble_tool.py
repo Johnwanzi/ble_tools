@@ -1021,13 +1021,13 @@ class BLEToolWindow(QMainWindow):
                         await self._client.stop_notify(uuid)
                     except Exception:
                         pass
-                QTimer.singleShot(0, lambda: self.btn_ping.setEnabled(True))
 
         self._async.run(_ping())
 
     def _on_ping_result(self, success: bool, text: str):
         color = "#2ecc71" if success else "#e74c3c"
         self.lbl_ping_result.setText(f'<span style="color:{color}">{text}</span>')
+        self.btn_ping.setEnabled(True)
 
     def _on_pair(self):
         """Initiate pairing (Linux only)."""
