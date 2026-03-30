@@ -637,6 +637,11 @@ class BLEToolWindow(QMainWindow):
             return
         address = selected.data(0, Qt.UserRole)
         name = selected.text(0)
+        # Use the BLEDevice object if available so BleakClient skips the
+        # internal re-scan (find_device_by_address) that runs when only an
+        # address string is supplied.
+        dev_item = self._devices.get(address)
+        ble_device = dev_item.device if dev_item else address
         self._log(f"Connecting to {name} ({address})...")
         self.btn_connect.setEnabled(False)
 
@@ -649,7 +654,11 @@ class BLEToolWindow(QMainWindow):
                         return
                     self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
 
-                self._client = BleakClient(address, disconnected_callback=_disconnected_cb)
+                self._client = BleakClient(
+                    ble_device,
+                    disconnected_callback=_disconnected_cb,
+                    winrt={"use_cached_services": False},
+                )
                 await self._client.connect()
                 self._connected_address = address
                 self.connection_done.emit(True, f"Connected to {name} ({address})")
