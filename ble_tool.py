@@ -76,6 +76,161 @@ class DeviceItem:
 
 
 # ---------------------------------------------------------------------------
+# Protocol V0 – frame building and minimal protobuf helpers
+# (same algorithm as webusb_upgrade.html)
+# ---------------------------------------------------------------------------
+
+_CRC8_TABLE = bytes([
+    0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
+    0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
+    0x23, 0x7d, 0x9f, 0xc1, 0x42, 0x1c, 0xfe, 0xa0, 0xe1, 0xbf, 0x5d, 0x03, 0x80, 0xde, 0x3c, 0x62,
+    0xbe, 0xe0, 0x02, 0x5c, 0xdf, 0x81, 0x63, 0x3d, 0x7c, 0x22, 0xc0, 0x9e, 0x1d, 0x43, 0xa1, 0xff,
+    0x46, 0x18, 0xfa, 0xa4, 0x27, 0x79, 0x9b, 0xc5, 0x84, 0xda, 0x38, 0x66, 0xe5, 0xbb, 0x59, 0x07,
+    0xdb, 0x85, 0x67, 0x39, 0xba, 0xe4, 0x06, 0x58, 0x19, 0x47, 0xa5, 0xfb, 0x78, 0x26, 0xc4, 0x9a,
+    0x65, 0x3b, 0xd9, 0x87, 0x04, 0x5a, 0xb8, 0xe6, 0xa7, 0xf9, 0x1b, 0x45, 0xc6, 0x98, 0x7a, 0x24,
+    0xf8, 0xa6, 0x44, 0x1a, 0x99, 0xc7, 0x25, 0x7b, 0x3a, 0x64, 0x86, 0xd8, 0x5b, 0x05, 0xe7, 0xb9,
+    0x8c, 0xd2, 0x30, 0x6e, 0xed, 0xb3, 0x51, 0x0f, 0x4e, 0x10, 0xf2, 0xac, 0x2f, 0x71, 0x93, 0xcd,
+    0x11, 0x4f, 0xad, 0xf3, 0x70, 0x2e, 0xcc, 0x92, 0xd3, 0x8d, 0x6f, 0x31, 0xb2, 0xec, 0x0e, 0x50,
+    0xaf, 0xf1, 0x13, 0x4d, 0xce, 0x90, 0x72, 0x2c, 0x6d, 0x33, 0xd1, 0x8f, 0x0c, 0x52, 0xb0, 0xee,
+    0x32, 0x6c, 0x8e, 0xd0, 0x53, 0x0d, 0xef, 0xb1, 0xf0, 0xae, 0x4c, 0x12, 0x91, 0xcf, 0x2d, 0x73,
+    0xca, 0x94, 0x76, 0x28, 0xab, 0xf5, 0x17, 0x49, 0x08, 0x56, 0xb4, 0xea, 0x69, 0x37, 0xd5, 0x8b,
+    0x57, 0x09, 0xeb, 0xb5, 0x36, 0x68, 0x8a, 0xd4, 0x95, 0xcb, 0x29, 0x77, 0xf4, 0xaa, 0x48, 0x16,
+    0xe9, 0xb7, 0x55, 0x0b, 0x88, 0xd6, 0x34, 0x6a, 0x2b, 0x75, 0x97, 0xc9, 0x4a, 0x14, 0xf6, 0xa8,
+    0x74, 0x2a, 0xc8, 0x96, 0x15, 0x4b, 0xa9, 0xf7, 0xb6, 0xe8, 0x0a, 0x54, 0xd7, 0x89, 0x6b, 0x35,
+])
+
+_PROTO_HEAD_SOF       = 0x5A
+_PROTO_HEAD_CRC_SIZE  = 8      # 7 header bytes + 1 tail CRC
+_PROTO_DATA_TYPE_PKT  = 0
+_CRC8_INIT            = 0x30
+
+_PB_MSG_TYPE_PING    = 60206
+_PB_MSG_TYPE_SUCCESS = 60207
+_PB_MSG_TYPE_FAILURE = 60208
+_PB_MSG_NAMES = {60206: "Ping", 60207: "Success", 60208: "Failure"}
+
+_proto_seq = 0
+
+
+def _crc8(data: bytes | bytearray, length: int) -> int:
+    crc = _CRC8_INIT
+    for i in range(length):
+        crc = _CRC8_TABLE[crc ^ data[i]]
+    return crc
+
+
+def _encode_varint(value: int) -> bytes:
+    result = []
+    while value > 0x7F:
+        result.append((value & 0x7F) | 0x80)
+        value >>= 7
+    result.append(value & 0x7F)
+    return bytes(result)
+
+
+def _decode_varint(data: bytes | bytearray, offset: int) -> tuple[int, int]:
+    value, shift = 0, 0
+    while offset < len(data):
+        byte = data[offset]; offset += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+    return value, offset
+
+
+def _encode_pb_string(field_num: int, s: str) -> bytes:
+    if not s:
+        return b""
+    encoded = s.encode("utf-8")
+    tag = _encode_varint((field_num << 3) | 2)
+    return tag + _encode_varint(len(encoded)) + encoded
+
+
+def pb_encode_ping(message: str = "") -> bytes:
+    """Encode  Ping { optional string message = 1; }"""
+    return _encode_pb_string(1, message)
+
+
+def pb_decode_success(pb: bytes) -> str:
+    """Decode  Success { optional string message = 1; }"""
+    offset, msg = 0, ""
+    while offset < len(pb):
+        tag, offset = _decode_varint(pb, offset)
+        fn, wt = tag >> 3, tag & 0x7
+        if fn == 1 and wt == 2:
+            ln, offset = _decode_varint(pb, offset)
+            msg = pb[offset:offset + ln].decode("utf-8", errors="replace")
+            offset += ln
+        else:
+            break
+    return msg
+
+
+def pb_decode_failure(pb: bytes) -> tuple[int, str]:
+    """Decode  Failure { optional FailureType code = 1; optional string message = 2; }"""
+    offset, code, msg = 0, 0, ""
+    while offset < len(pb):
+        tag, offset = _decode_varint(pb, offset)
+        fn, wt = tag >> 3, tag & 0x7
+        if fn == 1 and wt == 0:
+            code, offset = _decode_varint(pb, offset)
+        elif fn == 2 and wt == 2:
+            ln, offset = _decode_varint(pb, offset)
+            msg = pb[offset:offset + ln].decode("utf-8", errors="replace")
+            offset += ln
+        else:
+            break
+    return code, msg
+
+
+def build_proto_frame(payload: bytes, packet_src: int = 0, router: int = 0) -> bytes:
+    """Wrap payload in a Proto V0 frame (SOF + len + pre-CRC + attr + seq + payload + tail-CRC)."""
+    global _proto_seq
+    payload_len = len(payload)
+    frame_len   = payload_len + _PROTO_HEAD_CRC_SIZE
+    frame       = bytearray(frame_len)
+
+    _proto_seq  = (_proto_seq % 255) + 1   # cycles 1–255
+
+    frame[0] = _PROTO_HEAD_SOF
+    frame[1] = frame_len & 0xFF
+    frame[2] = (frame_len >> 8) & 0xFF
+    frame[3] = 0                                                              # pre-head CRC placeholder
+    frame[4] = router & 0xFF
+    frame[5] = ((packet_src & 0x0F) << 2) | (_PROTO_DATA_TYPE_PKT & 0x03)   # attr
+    frame[6] = _proto_seq
+    frame[3] = _crc8(frame, 3)                                               # pre-head CRC (bytes 0-2)
+    frame[7:7 + payload_len] = payload
+    frame[frame_len - 1] = _crc8(frame, frame_len - 1)                       # tail CRC
+    return bytes(frame)
+
+
+def build_pb_frame(msg_type: int, pb_payload: bytes,
+                   packet_src: int = 0, router: int = 0) -> bytes:
+    """Build a Proto V0 frame carrying  msg_type (2-byte LE) + protobuf payload."""
+    payload = bytes([msg_type & 0xFF, (msg_type >> 8) & 0xFF]) + pb_payload
+    return build_proto_frame(payload, packet_src, router)
+
+
+def parse_proto_frame(frame: bytes) -> bytes | None:
+    """Extract the inner payload from a Proto V0 frame, or None if malformed."""
+    if len(frame) < _PROTO_HEAD_CRC_SIZE or frame[0] != _PROTO_HEAD_SOF:
+        return None
+    frame_len = frame[1] | (frame[2] << 8)
+    if frame_len > len(frame):
+        return None
+    return bytes(frame[7:frame_len - 1])
+
+
+def parse_pb_response(payload: bytes) -> tuple[int, bytes] | None:
+    """Split payload into (msg_type, pb_bytes), or None if too short."""
+    if len(payload) < 2:
+        return None
+    return payload[0] | (payload[1] << 8), bytes(payload[2:])
+
+
+# ---------------------------------------------------------------------------
 # BlueZ Pairing Agent (D-Bus) - Linux only
 # ---------------------------------------------------------------------------
 if HAS_DBUS:
@@ -169,6 +324,7 @@ class BLEToolWindow(QMainWindow):
     char_value_read = pyqtSignal(str, object)  # uuid, bytes value
     char_notify_received = pyqtSignal(str, object)  # uuid, bytes value
     pairing_request = pyqtSignal(str, int, str)  # device_path, passkey, mode
+    ping_result_signal = pyqtSignal(bool, str)     # success, result_text
 
     def __init__(self):
         super().__init__()
@@ -277,6 +433,42 @@ class BLEToolWindow(QMainWindow):
         conn_layout.addLayout(conn_btns)
         right_layout.addWidget(conn_group)
 
+        # Ping / Protocol panel
+        ping_group = QGroupBox("Ping (Proto V0)")
+        ping_layout = QVBoxLayout(ping_group)
+
+        uuid_grid = QHBoxLayout()
+        uuid_grid.addWidget(QLabel("TX UUID:"))
+        self.ping_tx_uuid = QLineEdit()
+        self.ping_tx_uuid.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        uuid_grid.addWidget(self.ping_tx_uuid)
+        ping_layout.addLayout(uuid_grid)
+
+        uuid_grid2 = QHBoxLayout()
+        uuid_grid2.addWidget(QLabel("RX UUID:"))
+        self.ping_rx_uuid = QLineEdit()
+        self.ping_rx_uuid.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        uuid_grid2.addWidget(self.ping_rx_uuid)
+        ping_layout.addLayout(uuid_grid2)
+
+        msg_bar = QHBoxLayout()
+        msg_bar.addWidget(QLabel("Message:"))
+        self.ping_message = QLineEdit()
+        self.ping_message.setPlaceholderText("optional string payload")
+        self.ping_message.setText("Hello from BLE!")
+        msg_bar.addWidget(self.ping_message)
+        self.btn_ping = QPushButton("Send Ping")
+        self.btn_ping.setMinimumHeight(30)
+        self.btn_ping.setEnabled(False)
+        msg_bar.addWidget(self.btn_ping)
+        ping_layout.addLayout(msg_bar)
+
+        self.lbl_ping_result = QLabel("")
+        self.lbl_ping_result.setWordWrap(True)
+        ping_layout.addWidget(self.lbl_ping_result)
+
+        right_layout.addWidget(ping_group)
+
         # Service tree
         svc_group = QGroupBox("Services & Characteristics")
         svc_layout = QVBoxLayout(svc_group)
@@ -346,6 +538,8 @@ class BLEToolWindow(QMainWindow):
         self.btn_write.clicked.connect(self._on_char_write)
         self.btn_notify.clicked.connect(self._on_char_notify)
         self.btn_indicate.clicked.connect(self._on_char_indicate)
+        self.btn_ping.clicked.connect(self._on_ping)
+        self.ping_result_signal.connect(self._on_ping_result)
 
     # ---- Logging ----------------------------------------------------------
 
@@ -478,6 +672,7 @@ class BLEToolWindow(QMainWindow):
             self.lbl_conn.setText(msg)
             self.btn_connect.setEnabled(False)   # keep disabled while connected
             self.btn_disconnect.setEnabled(True)
+            self.btn_ping.setEnabled(True)
             if HAS_DBUS:
                 self.btn_pair.setEnabled(True)
         else:
@@ -699,6 +894,90 @@ class BLEToolWindow(QMainWindow):
                     char.setText(2, value_str)
                     return
 
+    # ---- Ping (Proto V0) --------------------------------------------------
+
+    def _on_ping(self):
+        if not self._client:
+            self._log("Ping: not connected.")
+            return
+
+        tx_uuid = self.ping_tx_uuid.text().strip()
+        rx_uuid = self.ping_rx_uuid.text().strip()
+        if not tx_uuid or not rx_uuid:
+            self._log("Ping: TX UUID and RX UUID are required.")
+            return
+
+        message = self.ping_message.text()
+        pb_payload = pb_encode_ping(message)
+        frame = build_pb_frame(_PB_MSG_TYPE_PING, pb_payload)
+
+        self._log(f"Ping TX ({len(frame)}B): {frame.hex(' ')}")
+        self.lbl_ping_result.setText("Waiting for response…")
+        self.btn_ping.setEnabled(False)
+
+        loop = self._async._loop
+
+        async def _ping():
+            response_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+            def _notify_cb(handle, data: bytearray):
+                loop.call_soon_threadsafe(response_queue.put_nowait, bytes(data))
+
+            try:
+                await self._client.start_notify(rx_uuid, _notify_cb)
+                await self._client.write_gatt_char(tx_uuid, frame, response=False)
+
+                try:
+                    rx_data = await asyncio.wait_for(response_queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    self.log_signal.emit("Ping: timeout — no response received.")
+                    self.ping_result_signal.emit(False, "Timeout")
+                    return
+
+                self.log_signal.emit(f"Ping RX ({len(rx_data)}B): {rx_data.hex(' ')}")
+
+                payload = parse_proto_frame(rx_data)
+                if payload is None:
+                    self.log_signal.emit("Ping: malformed Proto V0 frame in response.")
+                    self.ping_result_signal.emit(False, "Bad frame")
+                    return
+
+                parsed = parse_pb_response(payload)
+                if parsed is None:
+                    self.log_signal.emit("Ping: response payload too short.")
+                    self.ping_result_signal.emit(False, "Bad payload")
+                    return
+
+                msg_type, pb = parsed
+                name = _PB_MSG_NAMES.get(msg_type, f"Unknown({msg_type})")
+                if msg_type == _PB_MSG_TYPE_SUCCESS:
+                    decoded = pb_decode_success(pb)
+                    self.log_signal.emit(f"Ping OK  msg_type={msg_type} ({name})  response=\"{decoded}\"")
+                    self.ping_result_signal.emit(True, f"Success: \"{decoded}\"")
+                elif msg_type == _PB_MSG_TYPE_FAILURE:
+                    code, decoded = pb_decode_failure(pb)
+                    self.log_signal.emit(f"Ping FAIL  msg_type={msg_type} ({name})  code={code}  \"{decoded}\"")
+                    self.ping_result_signal.emit(False, f"Failure code={code}: \"{decoded}\"")
+                else:
+                    self.log_signal.emit(f"Ping unexpected msg_type={msg_type} ({name})")
+                    self.ping_result_signal.emit(False, f"Unexpected msg_type={msg_type} ({name})")
+
+            except Exception as exc:
+                self.log_signal.emit(f"Ping error: {exc}")
+                self.ping_result_signal.emit(False, f"Error: {exc}")
+            finally:
+                try:
+                    await self._client.stop_notify(rx_uuid)
+                except Exception:
+                    pass
+                QTimer.singleShot(0, lambda: self.btn_ping.setEnabled(True))
+
+        self._async.run(_ping())
+
+    def _on_ping_result(self, success: bool, text: str):
+        color = "#2ecc71" if success else "#e74c3c"
+        self.lbl_ping_result.setText(f'<span style="color:{color}">{text}</span>')
+
     def _on_pair(self):
         """Initiate pairing (Linux only)."""
         if not HAS_DBUS:
@@ -731,6 +1010,8 @@ class BLEToolWindow(QMainWindow):
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
         self.btn_pair.setEnabled(False)
+        self.btn_ping.setEnabled(False)
+        self.lbl_ping_result.setText("")
         self.service_tree.clear()
         self._notifying.clear()
         self.btn_read.setEnabled(False)
