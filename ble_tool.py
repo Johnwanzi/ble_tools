@@ -909,7 +909,7 @@ class BLEToolWindow(QMainWindow):
 
         message = self.ping_message.text()
         pb_payload = pb_encode_ping(message)
-        frame = build_pb_frame(_PB_MSG_TYPE_PING, pb_payload)
+        frame = build_pb_frame(_PB_MSG_TYPE_PING, pb_payload, router=1)
 
         self._log(f"Ping TX ({len(frame)}B): {frame.hex(' ')}")
         self.lbl_ping_result.setText("Waiting for response…")
