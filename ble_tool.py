@@ -1206,17 +1206,23 @@ class BLEToolWindow(QMainWindow):
             self._log("File I/O: no write characteristic selected.")
         return uuid
 
-    def _fio_has_notify(self, uuid: str) -> bool:
+    def _fio_char_props(self, uuid: str) -> set[str]:
         for svc in self._client.services:
             for char in svc.characteristics:
                 if char.uuid == uuid:
-                    return "notify" in char.properties
-        return False
+                    return set(char.properties)
+        return set()
+
+    def _fio_has_notify(self, uuid: str) -> bool:
+        return "notify" in self._fio_char_props(uuid)
 
     async def _fio_transact(self, uuid: str, frame: bytes,
                             queue: asyncio.Queue, timeout: float = 10.0) -> bytes:
-        """Write frame, wait for one notify response."""
-        await self._client.write_gatt_char(uuid, frame, response=False)
+        """Write frame then wait for one notify response.
+        Uses write-without-response when supported, falls back to write-with-response."""
+        props = self._fio_char_props(uuid)
+        use_response = "write-without-response" not in props
+        await self._client.write_gatt_char(uuid, frame, response=use_response)
         return await asyncio.wait_for(queue.get(), timeout=timeout)
 
     def _fio_parse_response(self, rx: bytes) -> tuple[int, bytes] | None:
@@ -1300,6 +1306,12 @@ class BLEToolWindow(QMainWindow):
                     file_pb  = pb_encode_file(device_path, offset, total, chunk)
                     write_pb = pb_encode_file_write(file_pb, overwrite, False)
                     frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
+                    mtu = self._client.mtu_size
+                    if len(frame) > mtu:
+                        raise RuntimeError(
+                            f"Frame {len(frame)} B exceeds MTU {mtu} B — "
+                            f"reduce chunk size to {chunk_size - (len(frame) - mtu)} B or less"
+                        )
 
                     if has_notify:
                         rx = await self._fio_transact(uuid, frame, queue, timeout=10.0)
@@ -1317,7 +1329,9 @@ class BLEToolWindow(QMainWindow):
                         else:
                             offset += len(chunk)
                     else:
-                        await self._client.write_gatt_char(uuid, frame, response=False)
+                        props = self._fio_char_props(uuid)
+                        use_resp = "write-without-response" not in props
+                        await self._client.write_gatt_char(uuid, frame, response=use_resp)
                         offset += len(chunk)
 
                     overwrite = False
