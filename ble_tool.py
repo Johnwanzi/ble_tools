@@ -1324,6 +1324,7 @@ class BLEToolWindow(QMainWindow):
             return
         if pct >= 0:
             self.fw_progress.setValue(pct)
+            self.fw_progress.setFormat(f"{text}  ({pct}%)")
         color = "#2ecc71" if pct == 100 else ("#e74c3c" if pct == -1 else "#eee")
         self.lbl_fw_status.setText(f'<span style="color:{color}">{text}</span>')
 
