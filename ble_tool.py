@@ -656,8 +656,8 @@ class BLEToolWindow(QMainWindow):
                 await self._client.connect()
                 self._connected_address = address
                 self.connection_done.emit(True, f"Connected to {name} ({address})")
-                # Discover services
-                services = self._client.services
+                # Explicitly discover services every time (avoids stale cache on reconnect)
+                services = await self._client.get_services()
                 self.services_discovered.emit(services)
             except Exception as e:
                 self.connection_done.emit(False, f"Connection failed: {e}")
