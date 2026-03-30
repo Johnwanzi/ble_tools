@@ -106,10 +106,9 @@ _PB_MSG_TYPE_SUCCESS   = 60207
 _PB_MSG_TYPE_FAILURE   = 60208
 _PB_MSG_TYPE_FILE      = 60803
 _PB_MSG_TYPE_FILEWRITE = 60805
-_PB_MSG_TYPE_FILEREAD  = 60804
 _PB_MSG_NAMES = {
     60206: "Ping", 60207: "Success", 60208: "Failure",
-    60803: "File", 60804: "FileRead", 60805: "FileWrite",
+    60803: "File", 60805: "FileWrite",
 }
 
 _proto_seq = 0
@@ -283,13 +282,6 @@ def pb_encode_file_write(file_bytes: bytes, overwrite: bool, append: bool) -> by
     )
 
 
-def pb_encode_file_read(file_bytes: bytes, chunk_len: int | None = None) -> bytes:
-    """Encode  FileRead { file=1, chunk_len=2 }"""
-    result = _encode_pb_message(1, file_bytes)
-    if chunk_len is not None:
-        result += _encode_pb_uint32(2, chunk_len)
-    return result
-
 
 def pb_decode_file(pb: bytes) -> dict:
     """Decode  File { path=1, offset=2, total_size=3, data=4, processed_byte=6 }"""
@@ -409,7 +401,6 @@ class BLEToolWindow(QMainWindow):
     pairing_request = pyqtSignal(str, int, str)  # device_path, passkey, mode
     ping_result_signal = pyqtSignal(bool, str)     # success, result_text
     fw_progress_signal = pyqtSignal(int, str)      # percent 0-100, status text
-    fr_progress_signal = pyqtSignal(int, str)      # percent 0-100, status text
 
     def __init__(self):
         super().__init__()
@@ -426,7 +417,6 @@ class BLEToolWindow(QMainWindow):
         self._pairing_result: bool | None = None
         self._fw_file_data: bytes | None = None   # local file to upload
         self._fw_abort = False
-        self._fr_abort = False
 
         self._init_ui()
         self._connect_signals()
@@ -649,36 +639,6 @@ class BLEToolWindow(QMainWindow):
         self.lbl_fw_status.setWordWrap(True)
         fio_layout.addWidget(self.lbl_fw_status)
 
-        # Read section
-        read_lbl = QLabel("Read file from device:")
-        read_lbl.setStyleSheet("font-weight: bold;")
-        fio_layout.addWidget(read_lbl)
-
-        fr_chunk_bar = QHBoxLayout()
-        fr_chunk_bar.addWidget(QLabel("Chunk size:"))
-        self.fr_chunk_spin = QSpinBox()
-        self.fr_chunk_spin.setRange(512, 4096)
-        self.fr_chunk_spin.setSingleStep(512)
-        self.fr_chunk_spin.setValue(512)
-        self.fr_chunk_spin.setSuffix(" B")
-        fr_chunk_bar.addWidget(self.fr_chunk_spin)
-        fr_chunk_bar.addStretch()
-        self.btn_fr_recv = QPushButton("Download")
-        self.btn_fr_recv.setMinimumHeight(28)
-        self.btn_fr_recv.setEnabled(False)
-        fr_chunk_bar.addWidget(self.btn_fr_recv)
-        fio_layout.addLayout(fr_chunk_bar)
-
-        self.fr_progress = QProgressBar()
-        self.fr_progress.setRange(0, 100)
-        self.fr_progress.setValue(0)
-        self.fr_progress.setTextVisible(True)
-        self.fr_progress.setVisible(False)
-        fio_layout.addWidget(self.fr_progress)
-
-        self.lbl_fr_status = QLabel("")
-        self.lbl_fr_status.setWordWrap(True)
-        fio_layout.addWidget(self.lbl_fr_status)
 
         right_layout.addWidget(fio_group)
 
@@ -721,9 +681,7 @@ class BLEToolWindow(QMainWindow):
         self.btn_fw_browse.clicked.connect(self._on_fw_browse)
         self.btn_fw_send.clicked.connect(self._on_fw_send)
         self.btn_fw_abort.clicked.connect(self._on_fw_abort)
-        self.btn_fr_recv.clicked.connect(self._on_fr_recv)
         self.fw_progress_signal.connect(self._on_fw_progress)
-        self.fr_progress_signal.connect(self._on_fr_progress)
 
     # ---- Logging ----------------------------------------------------------
 
@@ -884,7 +842,6 @@ class BLEToolWindow(QMainWindow):
             self.btn_disconnect.setEnabled(True)
             self.btn_ping.setEnabled(True)
             self.btn_fw_send.setEnabled(True)
-            self.btn_fr_recv.setEnabled(True)
             if HAS_DBUS:
                 self.btn_pair.setEnabled(True)
         else:
@@ -1368,115 +1325,6 @@ class BLEToolWindow(QMainWindow):
         color = "#2ecc71" if pct == 100 else ("#e74c3c" if pct == -1 else "#eee")
         self.lbl_fw_status.setText(f'<span style="color:{color}">{text}</span>')
 
-    # ---- Download (Read) ----------------------------------------------------
-
-    def _on_fr_recv(self):
-        if not self._client:
-            self._log("File read: not connected."); return
-        uuid = self._fio_uuid()
-        if not uuid: return
-        device_path = self.fio_device_path.text().strip()
-        if not device_path:
-            self._log("File read: device path is empty."); return
-
-        # Ask where to save
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save downloaded file",
-            device_path.split(":")[-1] if ":" in device_path else device_path)
-        if not save_path:
-            return
-
-        chunk_size = self.fr_chunk_spin.value()
-        has_notify = self._fio_has_notify(uuid)
-        loop       = self._async._loop
-        self._fr_abort = False
-
-        self.btn_fr_recv.setEnabled(False)
-        self.fr_progress.setVisible(True)
-        self.fr_progress.setValue(0)
-        self.fr_progress_signal.emit(0, "Starting…")
-
-        async def _download():
-            queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-            def _notify_cb(handle, raw: bytearray):
-                loop.call_soon_threadsafe(queue.put_nowait, bytes(raw))
-
-            received = bytearray()
-            total = None
-
-            try:
-                if has_notify:
-                    await self._client.start_notify(uuid, _notify_cb)
-
-                offset = 0
-                while True:
-                    if self._fr_abort:
-                        self.fr_progress_signal.emit(-1, "Aborted")
-                        return
-
-                    file_pb  = pb_encode_file(device_path, offset, 0)
-                    read_pb  = pb_encode_file_read(file_pb, chunk_size)
-                    frame    = build_pb_frame(_PB_MSG_TYPE_FILEREAD, read_pb, router=1)
-
-                    if has_notify:
-                        rx = await self._fio_transact(uuid, frame, queue, timeout=10.0)
-                        parsed = self._fio_parse_response(rx)
-                        if parsed is None:
-                            raise RuntimeError("Bad proto frame in response")
-                        msg_type, pb = parsed
-                        if msg_type == _PB_MSG_TYPE_FAILURE:
-                            code, msg = pb_decode_failure(pb)
-                            raise RuntimeError(f"Device error code={code}: {msg}")
-                        if msg_type != _PB_MSG_TYPE_FILE:
-                            raise RuntimeError(f"Unexpected msg_type={msg_type}")
-                        dec = pb_decode_file(pb)
-                        chunk_data = dec.get("data") or b""
-                        if total is None:
-                            total = dec.get("total_size") or 0
-                        received += chunk_data
-                        offset = len(received)
-                    else:
-                        await self._client.write_gatt_char(uuid, frame, response=False)
-                        self.fr_progress_signal.emit(100, "Sent read request (no notify)")
-                        return
-
-                    pct = int(offset * 100 / total) if total else 0
-                    self.fr_progress_signal.emit(
-                        pct, f"{offset:,} / {total:,} B" if total else f"{offset:,} B")
-
-                    if total and offset >= total:
-                        break
-                    if not chunk_data:
-                        break
-
-                with open(save_path, "wb") as f:
-                    f.write(received)
-                self.fr_progress_signal.emit(100, f"Done  {len(received):,} B  → {save_path}")
-                self.log_signal.emit(f"File download complete: {len(received):,} B saved to {save_path}")
-
-            except Exception as exc:
-                self.fr_progress_signal.emit(-1, f"Error: {exc}")
-                self.log_signal.emit(f"File download error: {exc}")
-            finally:
-                if has_notify:
-                    try:
-                        await self._client.stop_notify(uuid)
-                    except Exception:
-                        pass
-                self.fr_progress_signal.emit(-2, "")
-
-        self._async.run(_download())
-
-    def _on_fr_progress(self, pct: int, text: str):
-        if pct == -2:
-            self.btn_fr_recv.setEnabled(True)
-            return
-        if pct >= 0:
-            self.fr_progress.setValue(pct)
-        color = "#2ecc71" if pct == 100 else ("#e74c3c" if pct == -1 else "#eee")
-        self.lbl_fr_status.setText(f'<span style="color:{color}">{text}</span>')
-
     def _on_pair(self):
         """Initiate pairing (Linux only)."""
         if not HAS_DBUS:
@@ -1517,11 +1365,8 @@ class BLEToolWindow(QMainWindow):
         self.ping_char_combo.clear()
         self.fio_char_combo.clear()
         self.btn_fw_send.setEnabled(False)
-        self.btn_fr_recv.setEnabled(False)
         self.fw_progress.setVisible(False)
-        self.fr_progress.setVisible(False)
         self.lbl_fw_status.setText("")
-        self.lbl_fr_status.setText("")
         self.service_tree.clear()
         self._notifying.clear()
         self.btn_read.setEnabled(False)
