@@ -643,11 +643,15 @@ class BLEToolWindow(QMainWindow):
         self._log(f"Connecting to {name} ({address})...")
         self.btn_connect.setEnabled(False)
 
-        def _disconnected_cb(client: BleakClient):
-            self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
-
         async def _connect():
             try:
+                def _disconnected_cb(client: BleakClient):
+                    # Guard: ignore stale callbacks from a previously disconnected
+                    # client (e.g. the old client fires after a reconnect).
+                    if self._client is not client:
+                        return
+                    self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
+
                 self._client = BleakClient(address, disconnected_callback=_disconnected_cb)
                 await self._client.connect()
                 self._connected_address = address
