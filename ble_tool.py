@@ -1296,17 +1296,15 @@ class BLEToolWindow(QMainWindow):
         return None
 
     async def _fio_transact(self, uuid: str, frame: bytes,
-                            queue: asyncio.Queue, timeout: float = 3.0) -> bytes:
+                            queue: asyncio.Queue, timeout: float = 3.0,
+                            *, frag_size: int = 244) -> bytes:
         """Fragment *frame* into MTU-sized BLE writes, then wait for one
-        notify response (ACK).  Timeout (default 3 s) starts after the
-        last fragment is sent."""
-        props = self._fio_char_props(uuid)
-        use_response = "write-without-response" not in props
-        mtu = self._client.mtu_size
-        frag_size = max(mtu - 3, 20)  # ATT payload = MTU - 3
+        notify response (ACK).  Always uses write-without-response for
+        fragments since the protocol-level ACK (notify) guarantees
+        delivery — no need for per-fragment BLE-level responses."""
         for i in range(0, len(frame), frag_size):
             frag = frame[i:i + frag_size]
-            await self._client.write_gatt_char(uuid, frag, response=use_response)
+            await self._client.write_gatt_char(uuid, frag, response=False)
         return await asyncio.wait_for(queue.get(), timeout=timeout)
 
     def _fio_parse_response(self, rx: bytes) -> tuple[int, bytes] | None:
@@ -1381,6 +1379,9 @@ class BLEToolWindow(QMainWindow):
             try:
                 await self._client.start_notify(notify_uuid, _notify_cb)
 
+                # Pre-compute fragment size once for the entire upload
+                frag_size = max(self._client.mtu_size - 3, 20)
+
                 offset = 0
                 overwrite = True
                 t_start = time.perf_counter()
@@ -1399,7 +1400,8 @@ class BLEToolWindow(QMainWindow):
 
                     # Send frame (MTU-fragmented) and wait for ACK
                     t_req = time.perf_counter()
-                    rx = await self._fio_transact(uuid, frame, queue, timeout=3.0)
+                    rx = await self._fio_transact(uuid, frame, queue,
+                                                  timeout=3.0, frag_size=frag_size)
                     t_ack = time.perf_counter()
                     rtt_sum += (t_ack - t_req)
                     rtt_count += 1
