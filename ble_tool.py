@@ -869,10 +869,19 @@ class BLEToolWindow(QMainWindow):
             if self._client:
                 old = self._client
                 self._client = None
+                # Release maintain_connection before disconnect
+                _be = getattr(old, '_backend', None)
+                if _be:
+                    _ss = getattr(_be, '_session', None)
+                    if _ss:
+                        try:
+                            _ss.maintain_connection = False
+                        except Exception:
+                            pass
                 try:
                     if old.is_connected:
                         self.log_signal.emit("Disconnecting previous session...")
-                        await old.disconnect()
+                        await asyncio.wait_for(old.disconnect(), timeout=5.0)
                 except Exception:
                     pass
                 del old
@@ -1621,10 +1630,22 @@ class BLEToolWindow(QMainWindow):
 
         async def _disconnect():
             try:
-                await client.disconnect()
-            except Exception:
-                pass
-            self.log_signal.emit("Disconnected.")
+                # Release maintain_connection so WinRT allows the link
+                # to drop instead of keeping it alive in the background.
+                backend = getattr(client, '_backend', None)
+                if backend:
+                    session = getattr(backend, '_session', None)
+                    if session:
+                        try:
+                            session.maintain_connection = False
+                        except Exception:
+                            pass
+                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+                self.log_signal.emit("Disconnected.")
+            except asyncio.TimeoutError:
+                self.log_signal.emit("Disconnect timed out — forcing cleanup.")
+            except Exception as e:
+                self.log_signal.emit(f"Disconnect error: {e}")
             QTimer.singleShot(0, lambda: self.btn_connect.setEnabled(True))
 
         self._async.run(_disconnect())
