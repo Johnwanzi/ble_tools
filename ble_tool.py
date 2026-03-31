@@ -930,36 +930,6 @@ class BLEToolWindow(QMainWindow):
                         except Exception:
                             pass
 
-                # --- Vendor-service re-discovery workaround ----
-                # On Windows reconnect, get_gatt_services_async(UNCACHED)
-                # may return before the device has registered its vendor
-                # services.  Detect this and force re-discovery.
-                services = self._client.services
-                has_vendor = any(
-                    not str(svc.uuid).startswith("0000") for svc in services
-                )
-                if not has_vendor:
-                    try:
-                        from winrt.windows.devices.bluetooth import BluetoothCacheMode
-                        _backend = self._client._backend
-                        for _retry in range(5):
-                            self.log_signal.emit(
-                                f"Vendor services not found, "
-                                f"re-discovering ({_retry + 1}/5)...")
-                            await asyncio.sleep(1.0)
-                            _backend.services = None   # clear early-return cache
-                            new_svc = await _backend._get_services(
-                                service_cache_mode=BluetoothCacheMode.UNCACHED,
-                                cache_mode=BluetoothCacheMode.UNCACHED,
-                            )
-                            _backend.services = new_svc
-                            if any(not str(s.uuid).startswith("0000")
-                                   for s in new_svc):
-                                break
-                    except Exception as e:
-                        self.log_signal.emit(
-                            f"Service re-discovery error: {e}")
-
                 mtu = self._client.mtu_size
                 self.connection_done.emit(True, f"Connected to {name} ({address})  MTU={mtu}")
                 services = self._client.services
