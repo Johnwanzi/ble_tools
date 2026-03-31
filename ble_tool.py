@@ -5,6 +5,7 @@ import sys
 import asyncio
 import signal
 import platform
+import time
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -1382,6 +1383,9 @@ class BLEToolWindow(QMainWindow):
 
                 offset = 0
                 overwrite = True
+                t_start = time.perf_counter()
+                rtt_sum = 0.0
+                rtt_count = 0
                 while offset < total:
                     if self._fw_abort:
                         self.fw_progress_signal.emit(
@@ -1394,7 +1398,12 @@ class BLEToolWindow(QMainWindow):
                     frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
 
                     # Send frame (MTU-fragmented) and wait for ACK
+                    t_req = time.perf_counter()
                     rx = await self._fio_transact(uuid, frame, queue, timeout=3.0)
+                    t_ack = time.perf_counter()
+                    rtt_sum += (t_ack - t_req)
+                    rtt_count += 1
+
                     parsed = self._fio_parse_response(rx)
                     if parsed is None:
                         raise RuntimeError("Bad proto frame in response")
@@ -1414,11 +1423,30 @@ class BLEToolWindow(QMainWindow):
 
                     # Progress updates only after ACK confirms
                     overwrite = False
+                    elapsed = t_ack - t_start
+                    speed = offset / elapsed if elapsed > 0 else 0
+                    avg_rtt = rtt_sum / rtt_count * 1000  # ms
                     pct = min(int(offset * 100 / total), 100)
-                    self.fw_progress_signal.emit(pct, f"{offset:,} / {total:,} B")
+                    self.fw_progress_signal.emit(
+                        pct,
+                        f"{offset:,}/{total:,} B  "
+                        f"{speed/1024:.1f} KB/s  "
+                        f"RTT {avg_rtt:.0f}ms")
 
-                self.fw_progress_signal.emit(100, f"Done  {total:,} B")
-                self.log_signal.emit(f"File upload complete: {device_path}  ({total:,} B)")
+                elapsed = time.perf_counter() - t_start
+                speed = total / elapsed if elapsed > 0 else 0
+                avg_rtt = rtt_sum / rtt_count * 1000 if rtt_count else 0
+                self.fw_progress_signal.emit(100,
+                    f"Done {total:,} B  "
+                    f"{speed/1024:.1f} KB/s  "
+                    f"RTT {avg_rtt:.0f}ms  "
+                    f"{elapsed:.1f}s")
+                self.log_signal.emit(
+                    f"File upload complete: {device_path}  {total:,} B  "
+                    f"avg {speed/1024:.1f} KB/s  "
+                    f"avg RTT {avg_rtt:.0f} ms  "
+                    f"total {elapsed:.1f} s  "
+                    f"({rtt_count} packets)")
 
             except Exception as exc:
                 self.fw_progress_signal.emit(-1, f"Error: {exc}")
