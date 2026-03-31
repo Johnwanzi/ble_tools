@@ -894,6 +894,38 @@ class BLEToolWindow(QMainWindow):
                     self._client._backend._retry_on_services_changed = True
                 await self._client.connect()
                 self._connected_address = address
+
+                # ---- Connection tuning (WinRT) ----
+                backend = getattr(self._client, '_backend', None)
+                if backend:
+                    # Keep connection active → lower latency scheduling
+                    session = getattr(backend, '_session', None)
+                    if session and getattr(session, 'can_maintain_connection', False):
+                        session.maintain_connection = True
+
+                    # Try to request shortest connection interval
+                    requester = getattr(backend, '_requester', None)
+                    if requester:
+                        try:
+                            from winrt.windows.devices.bluetooth import (
+                                BluetoothLEPreferredConnectionParameters,
+                            )
+                            params = BluetoothLEPreferredConnectionParameters.throughput_optimized
+                            await requester.request_preferred_connection_parameters(params)
+                            self.log_signal.emit("Requested ThroughputOptimized connection parameters")
+                        except Exception:
+                            pass  # API not available on this Windows build
+
+                        # Log actual connection parameters
+                        try:
+                            cp = requester.get_connection_parameters()
+                            self.log_signal.emit(
+                                f"Connection params: interval={cp.connection_interval:.1f}ms  "
+                                f"latency={cp.connection_latency}  "
+                                f"timeout={cp.link_timeout}ms")
+                        except Exception:
+                            pass
+
                 mtu = self._client.mtu_size
                 self.connection_done.emit(True, f"Connected to {name} ({address})  MTU={mtu}")
                 services = self._client.services
