@@ -863,9 +863,8 @@ class BLEToolWindow(QMainWindow):
                     pass
                 self._scanner = None
 
-            # Always check current connection state and force disconnect
-            # before connecting — ensures a clean slate with no cached
-            # GATT tables from a previous session.
+            # Force-disconnect any previous client so the Windows BLE
+            # stack releases all handles and clears the GATT cache.
             if self._client:
                 old = self._client
                 self._client = None
@@ -875,21 +874,6 @@ class BLEToolWindow(QMainWindow):
                         await old.disconnect()
                 except Exception:
                     pass
-
-            # Also probe via a temporary client: if the OS still considers
-            # the device connected (e.g. bonded auto-reconnect), disconnect
-            # it so the subsequent connect() starts from scratch.
-            try:
-                probe = BleakClient(
-                    ble_device,
-                    winrt={"use_cached_services": False},
-                )
-                await probe.connect()
-                if probe.is_connected:
-                    self.log_signal.emit("Device was already connected, disconnecting first...")
-                    await probe.disconnect()
-            except Exception:
-                pass
 
             try:
                 def _disconnected_cb(client: BleakClient):
