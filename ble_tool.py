@@ -1295,20 +1295,26 @@ class BLEToolWindow(QMainWindow):
                 return notify_uuid
         return None
 
-    async def _fio_transact(self, uuid: str, frame: bytes,
+    async def _fio_transact(self, char, frame: bytes,
                             queue: asyncio.Queue, timeout: float = 3.0,
-                            *, frag_size: int = 244) -> bytes:
-        """Fragment *frame* into MTU-sized BLE writes, then wait for one
-        notify response (ACK).  All fragments are submitted concurrently
-        via gather() to minimise Python event-loop round-trips."""
-        if len(frame) <= frag_size:
-            await self._client.write_gatt_char(uuid, frame, response=False)
+                            *, frag_size: int = 244,
+                            long_write: bool = False) -> bytes:
+        """Send *frame* via BLE write, then wait for one notify ACK.
+
+        When *long_write* is True the entire frame is sent in a single
+        write_gatt_char(response=True) call.  WinRT handles ATT Long
+        Write (Prepare Write + Execute Write) in one async operation,
+        eliminating per-fragment Python-level await overhead (~13 ms each
+        on a typical BLE connection interval).
+        """
+        if long_write:
+            await self._client.write_gatt_char(char, frame, response=True)
+        elif len(frame) <= frag_size:
+            await self._client.write_gatt_char(char, frame, response=False)
         else:
-            await asyncio.gather(*(
-                self._client.write_gatt_char(
-                    uuid, frame[i:i + frag_size], response=False)
-                for i in range(0, len(frame), frag_size)
-            ))
+            for i in range(0, len(frame), frag_size):
+                await self._client.write_gatt_char(
+                    char, frame[i:i + frag_size], response=False)
         return await asyncio.wait_for(queue.get(), timeout=timeout)
 
     def _fio_parse_response(self, rx: bytes) -> tuple[int, bytes] | None:
@@ -1386,6 +1392,21 @@ class BLEToolWindow(QMainWindow):
                 # Pre-compute fragment size once for the entire upload
                 frag_size = max(self._client.mtu_size - 3, 20)
 
+                # Pre-resolve characteristic object (skips per-write UUID lookup)
+                write_char = None
+                for svc in self._client.services:
+                    for c in svc.characteristics:
+                        if c.uuid == uuid:
+                            write_char = c
+                            break
+                    if write_char:
+                        break
+                # ATT Long Write: send entire frame in one async op instead
+                # of N per-fragment awaits (~13 ms each).  Requires the
+                # characteristic to support Write With Response ("write").
+                long_write = (write_char is not None
+                              and "write" in write_char.properties)
+
                 offset = 0
                 overwrite = True
                 t_start = time.perf_counter()
@@ -1402,10 +1423,27 @@ class BLEToolWindow(QMainWindow):
                     write_pb = pb_encode_file_write(file_pb, overwrite, False)
                     frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
 
-                    # Send frame (MTU-fragmented) and wait for ACK
+                    # Send frame and wait for ACK
                     t_req = time.perf_counter()
-                    rx = await self._fio_transact(uuid, frame, queue,
-                                                  timeout=3.0, frag_size=frag_size)
+                    try:
+                        rx = await self._fio_transact(
+                            write_char or uuid, frame, queue,
+                            timeout=3.0, frag_size=frag_size,
+                            long_write=long_write)
+                    except asyncio.TimeoutError:
+                        raise
+                    except Exception:
+                        if long_write:
+                            long_write = False
+                            self.log_signal.emit(
+                                "ATT Long Write unsupported, "
+                                "falling back to fragmentation")
+                            rx = await self._fio_transact(
+                                write_char or uuid, frame, queue,
+                                timeout=3.0, frag_size=frag_size,
+                                long_write=False)
+                        else:
+                            raise
                     t_ack = time.perf_counter()
                     rtt_sum += (t_ack - t_req)
                     rtt_count += 1
