@@ -1299,12 +1299,16 @@ class BLEToolWindow(QMainWindow):
                             queue: asyncio.Queue, timeout: float = 3.0,
                             *, frag_size: int = 244) -> bytes:
         """Fragment *frame* into MTU-sized BLE writes, then wait for one
-        notify response (ACK).  Always uses write-without-response for
-        fragments since the protocol-level ACK (notify) guarantees
-        delivery — no need for per-fragment BLE-level responses."""
-        for i in range(0, len(frame), frag_size):
-            frag = frame[i:i + frag_size]
-            await self._client.write_gatt_char(uuid, frag, response=False)
+        notify response (ACK).  All fragments are submitted concurrently
+        via gather() to minimise Python event-loop round-trips."""
+        if len(frame) <= frag_size:
+            await self._client.write_gatt_char(uuid, frame, response=False)
+        else:
+            await asyncio.gather(*(
+                self._client.write_gatt_char(
+                    uuid, frame[i:i + frag_size], response=False)
+                for i in range(0, len(frame), frag_size)
+            ))
         return await asyncio.wait_for(queue.get(), timeout=timeout)
 
     def _fio_parse_response(self, rx: bytes) -> tuple[int, bytes] | None:
