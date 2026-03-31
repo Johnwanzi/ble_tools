@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QTreeWidget, QTreeWidgetItem, QSplitter, QLabel,
     QHeaderView, QTextEdit, QLineEdit, QComboBox, QGroupBox,
     QMessageBox, QDialog, QDialogButtonBox, QMenu, QAction,
-    QInputDialog, QSpinBox, QFileDialog, QProgressBar,
+    QInputDialog, QSpinBox, QFileDialog, QProgressBar, QTabWidget,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QFont
@@ -139,6 +139,31 @@ def _decode_varint(data: bytes | bytearray, offset: int) -> tuple[int, int]:
             break
         shift += 7
     return value, offset
+
+
+def _calc_max_chunk(mtu: int, device_path: str) -> int:
+    """Compute max data bytes that fit in one MTU-sized Proto V0 + FileWrite frame.
+
+    Frame layout (bytes):
+      Proto V0:   SOF(1) len(2) pre-CRC(1) router(1) attr(1) seq(1) <payload> tail-CRC(1)  → 8 B
+      msg_type:   2 B (uint16 LE prefix inside payload)
+      FileWrite:  tag+len for embedded File message(4 B) + overwrite(2 B) + append(2 B)    → 8 B
+      File fixed: path tag+len+bytes  offset tag+varint(5)  total_size tag+varint(5)
+                  data tag(1) data len_varint(3)
+    """
+    path_bytes = device_path.encode("utf-8")
+    path_len = len(path_bytes)
+    # File message fixed overhead (no data content)
+    file_fixed = (
+        1 + len(_encode_varint(path_len)) + path_len   # field 1 path
+        + 1 + 5                                         # field 2 offset (worst-case 5-byte varint)
+        + 1 + 5                                         # field 3 total_size (worst-case 5-byte varint)
+        + 1 + 3                                         # field 4 data tag + len prefix (up to 64 KB)
+    )
+    # FileWrite overhead wrapping the File message
+    file_write = 1 + 3 + 2 + 2                         # tag+len(file msg) + overwrite + append
+    overhead = 8 + 2 + file_fixed + file_write          # proto_v0 + msg_type + file_fixed + file_write
+    return max(mtu - overhead, 16)
 
 
 def _encode_pb_string(field_num: int, s: str) -> bytes:
@@ -417,6 +442,7 @@ class BLEToolWindow(QMainWindow):
         self._pairing_result: bool | None = None
         self._fw_file_data: bytes | None = None   # local file to upload
         self._fw_abort = False
+        self._negotiated_mtu: int = 0             # MTU from last successful connect
 
         self._init_ui()
         self._connect_signals()
@@ -429,6 +455,7 @@ class BLEToolWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(6, 6, 6, 6)
 
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
@@ -436,6 +463,8 @@ class BLEToolWindow(QMainWindow):
         # --- Left panel: scan ---
         left = QWidget()
         left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(6)
 
         # Scan controls
         scan_bar = QHBoxLayout()
@@ -484,10 +513,14 @@ class BLEToolWindow(QMainWindow):
         # --- Right panel: connection / services ---
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(4)
 
         # Connection info
         conn_group = QGroupBox("Connection")
         conn_layout = QVBoxLayout(conn_group)
+        conn_layout.setContentsMargins(8, 4, 8, 6)
+        conn_layout.setSpacing(4)
         self.lbl_conn = QLabel("Not connected")
         self.lbl_conn.setFont(QFont("sans-serif", 10, QFont.Bold))
         conn_layout.addWidget(self.lbl_conn)
@@ -511,54 +544,28 @@ class BLEToolWindow(QMainWindow):
         conn_layout.addLayout(conn_btns)
         right_layout.addWidget(conn_group)
 
-        # Ping / Protocol panel
-        ping_group = QGroupBox("Ping (Proto V0)")
-        ping_layout = QVBoxLayout(ping_group)
-
-        char_bar = QHBoxLayout()
-        char_bar.addWidget(QLabel("Write Char:"))
-        self.ping_char_combo = QComboBox()
-        self.ping_char_combo.setPlaceholderText("Connect and discover services first")
-        self.ping_char_combo.setMinimumWidth(200)
-        char_bar.addWidget(self.ping_char_combo, 1)
-        ping_layout.addLayout(char_bar)
-
-        msg_bar = QHBoxLayout()
-        msg_bar.addWidget(QLabel("Message:"))
-        self.ping_message = QLineEdit()
-        self.ping_message.setPlaceholderText("optional string payload")
-        self.ping_message.setText("Hello from BLE!")
-        msg_bar.addWidget(self.ping_message)
-        self.btn_ping = QPushButton("Send Ping")
-        self.btn_ping.setMinimumHeight(30)
-        self.btn_ping.setEnabled(False)
-        msg_bar.addWidget(self.btn_ping)
-        ping_layout.addLayout(msg_bar)
-
-        self.lbl_ping_result = QLabel("")
-        self.lbl_ping_result.setWordWrap(True)
-        ping_layout.addWidget(self.lbl_ping_result)
-
-        right_layout.addWidget(ping_group)
-
-        # Service tree
+        # Services & Characteristics
         svc_group = QGroupBox("Services & Characteristics")
         svc_layout = QVBoxLayout(svc_group)
+        svc_layout.setContentsMargins(8, 12, 8, 8)
+        svc_layout.setSpacing(8)
         self.service_tree = QTreeWidget()
         self.service_tree.setHeaderLabels(["UUID", "Properties", "Value"])
         self.service_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.service_tree.setColumnWidth(1, 140)
         self.service_tree.setColumnWidth(2, 200)
+        self.service_tree.setIndentation(20)
         svc_layout.addWidget(self.service_tree)
 
         # Characteristic operation bar
         op_bar = QHBoxLayout()
+        op_bar.setSpacing(4)
         self.btn_read = QPushButton("Read")
         self.btn_write = QPushButton("Write")
         self.btn_notify = QPushButton("Notify")
         self.btn_indicate = QPushButton("Indicate")
         for btn in (self.btn_read, self.btn_write, self.btn_notify, self.btn_indicate):
-            btn.setMinimumHeight(30)
+            btn.setMinimumHeight(28)
             btn.setEnabled(False)
             op_bar.addWidget(btn)
         svc_layout.addLayout(op_bar)
@@ -574,92 +581,133 @@ class BLEToolWindow(QMainWindow):
         write_bar.addWidget(self.combo_write_type)
         svc_layout.addLayout(write_bar)
 
-        right_layout.addWidget(svc_group)
+        right_layout.addWidget(svc_group, 3)
 
-        # File I/O panel
-        fio_group = QGroupBox("File I/O (Proto V0)")
-        fio_layout = QVBoxLayout(fio_group)
+        # Protocol V0 (tabbed: Ping | File Write)
+        proto_group = QGroupBox("Protocol V0")
+        proto_layout = QVBoxLayout(proto_group)
+        proto_layout.setContentsMargins(8, 8, 8, 4)
+        proto_layout.setSpacing(4)
 
-        # Shared char selector
-        fio_char_bar = QHBoxLayout()
-        fio_char_bar.addWidget(QLabel("Write Char:"))
-        self.fio_char_combo = QComboBox()
-        self.fio_char_combo.setMinimumWidth(200)
-        fio_char_bar.addWidget(self.fio_char_combo, 1)
-        fio_layout.addLayout(fio_char_bar)
+        # Shared write characteristic selector
+        char_bar = QHBoxLayout()
+        char_bar.addWidget(QLabel("Write Char:"))
+        self.write_char_combo = QComboBox()
+        self.write_char_combo.setPlaceholderText("Connect and discover services first")
+        char_bar.addWidget(self.write_char_combo, 1)
+        proto_layout.addLayout(char_bar)
 
-        # Device path
+        self.proto_tabs = QTabWidget()
+        self.proto_tabs.setDocumentMode(True)
+
+        # -- Ping tab --
+        ping_tab = QWidget()
+        ping_lay = QVBoxLayout(ping_tab)
+        ping_lay.setContentsMargins(4, 8, 4, 4)
+        ping_lay.setSpacing(4)
+
+        msg_bar = QHBoxLayout()
+        msg_bar.addWidget(QLabel("Message:"))
+        self.ping_message = QLineEdit()
+        self.ping_message.setPlaceholderText("optional string payload")
+        self.ping_message.setText("Hello from BLE!")
+        msg_bar.addWidget(self.ping_message)
+        self.btn_ping = QPushButton("Send Ping")
+        self.btn_ping.setMinimumHeight(28)
+        self.btn_ping.setEnabled(False)
+        msg_bar.addWidget(self.btn_ping)
+        ping_lay.addLayout(msg_bar)
+
+        self.lbl_ping_result = QLabel("")
+        self.lbl_ping_result.setWordWrap(True)
+        ping_lay.addWidget(self.lbl_ping_result)
+        ping_lay.addStretch()
+
+        self.proto_tabs.addTab(ping_tab, "Ping")
+
+        # -- File Write tab --
+        fw_tab = QWidget()
+        fw_lay = QVBoxLayout(fw_tab)
+        fw_lay.setContentsMargins(4, 8, 4, 4)
+        fw_lay.setSpacing(4)
+
         path_bar = QHBoxLayout()
         path_bar.addWidget(QLabel("Device path:"))
         self.fio_device_path = QLineEdit("vol0:test.bin")
         path_bar.addWidget(self.fio_device_path, 1)
-        fio_layout.addLayout(path_bar)
-
-        # Write section
-        write_lbl = QLabel("Write file to device:")
-        write_lbl.setStyleSheet("font-weight: bold;")
-        fio_layout.addWidget(write_lbl)
+        fw_lay.addLayout(path_bar)
 
         fw_file_bar = QHBoxLayout()
         self.btn_fw_browse = QPushButton("Browse...")
-        self.btn_fw_browse.setMinimumHeight(28)
+        self.btn_fw_browse.setMinimumHeight(26)
         fw_file_bar.addWidget(self.btn_fw_browse)
         fw_file_bar.addStretch()
-        fio_layout.addLayout(fw_file_bar)
+        fw_lay.addLayout(fw_file_bar)
 
         self.fw_file_info = QTextEdit()
         self.fw_file_info.setReadOnly(True)
-        self.fw_file_info.setFixedHeight(60)
+        self.fw_file_info.setFixedHeight(54)
         self.fw_file_info.setPlaceholderText("No file selected")
         self.fw_file_info.setStyleSheet(
             "QTextEdit { background: #1a1a1a; color: #aaa; "
-            "border: 1px solid #444; border-radius: 4px; font-family: monospace; }")
-        fio_layout.addWidget(self.fw_file_info)
+            "border: 1px solid #444; border-radius: 4px; "
+            "font-family: monospace; font-size: 11px; }")
+        fw_lay.addWidget(self.fw_file_info)
 
         fw_chunk_bar = QHBoxLayout()
-        fw_chunk_bar.addWidget(QLabel("Chunk size:"))
+        fw_chunk_bar.addWidget(QLabel("Chunk:"))
         self.fw_chunk_spin = QSpinBox()
-        self.fw_chunk_spin.setRange(512, 4096)
-        self.fw_chunk_spin.setSingleStep(512)
-        self.fw_chunk_spin.setValue(512)
+        self.fw_chunk_spin.setRange(16, 2048)
+        self.fw_chunk_spin.setSingleStep(64)
+        self.fw_chunk_spin.setValue(2048)
         self.fw_chunk_spin.setSuffix(" B")
+        self.fw_chunk_spin.setToolTip("Auto-set to MTU-derived max after connection")
         fw_chunk_bar.addWidget(self.fw_chunk_spin)
+        self.lbl_chunk_mtu = QLabel("(connect to auto-set)")
+        self.lbl_chunk_mtu.setStyleSheet("color: #888; font-size: 11px;")
+        fw_chunk_bar.addWidget(self.lbl_chunk_mtu)
         fw_chunk_bar.addStretch()
         self.btn_fw_send = QPushButton("Upload")
-        self.btn_fw_send.setMinimumHeight(28)
+        self.btn_fw_send.setMinimumHeight(26)
         self.btn_fw_send.setEnabled(False)
         self.btn_fw_abort = QPushButton("Abort")
-        self.btn_fw_abort.setMinimumHeight(28)
+        self.btn_fw_abort.setMinimumHeight(26)
         self.btn_fw_abort.setEnabled(False)
         fw_chunk_bar.addWidget(self.btn_fw_send)
         fw_chunk_bar.addWidget(self.btn_fw_abort)
-        fio_layout.addLayout(fw_chunk_bar)
+        fw_lay.addLayout(fw_chunk_bar)
 
         self.fw_progress = QProgressBar()
         self.fw_progress.setRange(0, 100)
         self.fw_progress.setValue(0)
         self.fw_progress.setTextVisible(True)
         self.fw_progress.setVisible(False)
-        fio_layout.addWidget(self.fw_progress)
+        fw_lay.addWidget(self.fw_progress)
 
         self.lbl_fw_status = QLabel("")
         self.lbl_fw_status.setWordWrap(True)
-        fio_layout.addWidget(self.lbl_fw_status)
+        fw_lay.addWidget(self.lbl_fw_status)
 
+        self.proto_tabs.addTab(fw_tab, "File Write")
 
-        right_layout.addWidget(fio_group)
+        proto_layout.addWidget(self.proto_tabs)
+        right_layout.addWidget(proto_group)
 
         # Log
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout(log_group)
+        log_layout.setContentsMargins(4, 6, 4, 4)
+        log_layout.setSpacing(0)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.document().setDefaultStyleSheet(
+            "p { margin: 0px; padding: 0px; line-height: 1.2; }")
         log_layout.addWidget(self.log_text)
-        right_layout.addWidget(log_group)
+        right_layout.addWidget(log_group, 1)
 
         splitter.addWidget(right)
-        splitter.setSizes([400, 700])
+        splitter.setSizes([350, 750])
 
     def _connect_signals(self):
         self.btn_scan.clicked.connect(self._toggle_scan)
@@ -689,6 +737,7 @@ class BLEToolWindow(QMainWindow):
         self.btn_fw_send.clicked.connect(self._on_fw_send)
         self.btn_fw_abort.clicked.connect(self._on_fw_abort)
         self.fw_progress_signal.connect(self._on_fw_progress)
+        self.fio_device_path.textChanged.connect(self._update_chunk_from_mtu)
 
     # ---- Logging ----------------------------------------------------------
 
@@ -814,10 +863,36 @@ class BLEToolWindow(QMainWindow):
                     pass
                 self._scanner = None
 
+            # Always check current connection state and force disconnect
+            # before connecting — ensures a clean slate with no cached
+            # GATT tables from a previous session.
+            if self._client:
+                old = self._client
+                self._client = None
+                try:
+                    if old.is_connected:
+                        self.log_signal.emit("Disconnecting previous session...")
+                        await old.disconnect()
+                except Exception:
+                    pass
+
+            # Also probe via a temporary client: if the OS still considers
+            # the device connected (e.g. bonded auto-reconnect), disconnect
+            # it so the subsequent connect() starts from scratch.
+            try:
+                probe = BleakClient(
+                    ble_device,
+                    winrt={"use_cached_services": False},
+                )
+                await probe.connect()
+                if probe.is_connected:
+                    self.log_signal.emit("Device was already connected, disconnecting first...")
+                    await probe.disconnect()
+            except Exception:
+                pass
+
             try:
                 def _disconnected_cb(client: BleakClient):
-                    # Guard: ignore stale callbacks from a previously disconnected
-                    # client (e.g. the old client fires after a reconnect).
                     if self._client is not client:
                         return
                     self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
@@ -827,28 +902,38 @@ class BLEToolWindow(QMainWindow):
                     disconnected_callback=_disconnected_cb,
                     winrt={"use_cached_services": False},
                 )
-                # On Windows reconnect the GATT stack fires services_changed
-                # events while re-enumerating; enable retry so bleak loops
-                # until the list stabilises before returning.
-                self._client._retry_on_services_changed = True
+                # Set retry flag on the WinRT *backend* so that when
+                # services_changed events fire during reconnect, service
+                # discovery is restarted until the list stabilises.
+                if hasattr(self._client, '_backend'):
+                    self._client._backend._retry_on_services_changed = True
                 await self._client.connect()
                 self._connected_address = address
                 mtu = self._client.mtu_size
                 self.connection_done.emit(True, f"Connected to {name} ({address})  MTU={mtu}")
                 services = self._client.services
                 self.services_discovered.emit(services)
-                # Update chunk size to device MTU minus ATT overhead (3 bytes)
-                payload = max(mtu - 3, 20)
-                self.log_signal.emit(f"MTU negotiated: {mtu}  usable payload: {payload} B")
-                QTimer.singleShot(0, lambda: self._apply_mtu(payload))
+                self.log_signal.emit(f"MTU negotiated: {mtu}")
+                QTimer.singleShot(0, lambda m=mtu: self._apply_mtu(m))
             except Exception as e:
                 self.connection_done.emit(False, f"Connection failed: {e}")
 
         self._async.run(_connect())
 
-    def _apply_mtu(self, payload: int):
-        """Set chunk size spinboxes to the negotiated MTU payload size."""
-        self.fw_chunk_spin.setValue(payload)
+    def _apply_mtu(self, mtu: int):
+        """Store negotiated MTU and update the chunk-size UI hint."""
+        self._negotiated_mtu = mtu
+        self._update_chunk_from_mtu()
+
+    def _update_chunk_from_mtu(self):
+        """Update the chunk-size UI label with current MTU info."""
+        mtu = self._negotiated_mtu
+        if mtu <= 0:
+            return
+        self.fw_chunk_spin.setRange(16, 2048)
+        self.fw_chunk_spin.setSingleStep(64)
+        self.fw_chunk_spin.setValue(2048)
+        self.lbl_chunk_mtu.setText(f"(MTU {mtu}, chunk max 2048 B)")
 
     def _on_connection_done(self, success: bool, msg: str):
         self._log(msg)
@@ -907,8 +992,8 @@ class BLEToolWindow(QMainWindow):
 
         self.service_tree.expandAll()
 
-        # Populate ping char combo with all writable characteristics
-        self.ping_char_combo.clear()
+        # Populate shared write characteristic combo
+        self.write_char_combo.clear()
         for service in services:
             for char in service.characteristics:
                 props = char.properties  # list[str]
@@ -924,8 +1009,7 @@ class BLEToolWindow(QMainWindow):
                     if "notify" in props:
                         props_note.append("notify")
                     label += f"  [{', '.join(props_note)}]"
-                    self.ping_char_combo.addItem(label, char.uuid)
-                    self.fio_char_combo.addItem(label, char.uuid)
+                    self.write_char_combo.addItem(label, char.uuid)
 
     # ---- Characteristic Operations ------------------------------------------
 
@@ -1106,18 +1190,13 @@ class BLEToolWindow(QMainWindow):
             self._log("Ping: not connected.")
             return
 
-        uuid = self.ping_char_combo.currentData()
+        uuid = self.write_char_combo.currentData()
         if not uuid:
             self._log("Ping: no write characteristic selected.")
             return
 
-        # Determine if this characteristic also supports notify
-        has_notify = False
-        for svc in self._client.services:
-            for char in svc.characteristics:
-                if char.uuid == uuid:
-                    has_notify = "notify" in char.properties
-                    break
+        # Find a notify-capable characteristic in the same service
+        notify_uuid = self._fio_find_notify_uuid(uuid)
 
         message = self.ping_message.text()
         pb_payload = pb_encode_ping(message)
@@ -1136,13 +1215,13 @@ class BLEToolWindow(QMainWindow):
                 loop.call_soon_threadsafe(response_queue.put_nowait, bytes(data))
 
             try:
-                if has_notify:
-                    await self._client.start_notify(uuid, _notify_cb)
+                if notify_uuid:
+                    await self._client.start_notify(notify_uuid, _notify_cb)
 
                 await self._client.write_gatt_char(uuid, frame, response=False)
 
-                if not has_notify:
-                    self.log_signal.emit("Ping sent (characteristic has no notify — response skipped).")
+                if not notify_uuid:
+                    self.log_signal.emit("Ping sent (no notify characteristic in service — response skipped).")
                     self.ping_result_signal.emit(True, "Sent (no notify)")
                     return
 
@@ -1185,9 +1264,9 @@ class BLEToolWindow(QMainWindow):
                 self.log_signal.emit(f"Ping error: {exc}")
                 self.ping_result_signal.emit(False, f"Error: {exc}")
             finally:
-                if has_notify:
+                if notify_uuid:
                     try:
-                        await self._client.stop_notify(uuid)
+                        await self._client.stop_notify(notify_uuid)
                     except Exception:
                         pass
 
@@ -1201,7 +1280,7 @@ class BLEToolWindow(QMainWindow):
     # ---- File I/O (Proto V0) ------------------------------------------------
 
     def _fio_uuid(self) -> str | None:
-        uuid = self.fio_char_combo.currentData()
+        uuid = self.write_char_combo.currentData()
         if not uuid:
             self._log("File I/O: no write characteristic selected.")
         return uuid
@@ -1213,16 +1292,36 @@ class BLEToolWindow(QMainWindow):
                     return set(char.properties)
         return set()
 
-    def _fio_has_notify(self, uuid: str) -> bool:
-        return "notify" in self._fio_char_props(uuid)
+    def _fio_find_notify_uuid(self, write_uuid: str) -> str | None:
+        """Find a notify-capable characteristic in the same service as *write_uuid*.
+        Returns *write_uuid* itself if it supports notify, otherwise looks for
+        a sibling characteristic with notify."""
+        for svc in self._client.services:
+            has_write = False
+            notify_uuid = None
+            for char in svc.characteristics:
+                if char.uuid == write_uuid:
+                    has_write = True
+                    if "notify" in char.properties:
+                        return write_uuid  # same char has both
+                if "notify" in char.properties:
+                    notify_uuid = char.uuid
+            if has_write and notify_uuid:
+                return notify_uuid
+        return None
 
     async def _fio_transact(self, uuid: str, frame: bytes,
-                            queue: asyncio.Queue, timeout: float = 10.0) -> bytes:
-        """Write frame then wait for one notify response.
-        Uses write-without-response when supported, falls back to write-with-response."""
+                            queue: asyncio.Queue, timeout: float = 3.0) -> bytes:
+        """Fragment *frame* into MTU-sized BLE writes, then wait for one
+        notify response (ACK).  Timeout (default 3 s) starts after the
+        last fragment is sent."""
         props = self._fio_char_props(uuid)
         use_response = "write-without-response" not in props
-        await self._client.write_gatt_char(uuid, frame, response=use_response)
+        mtu = self._client.mtu_size
+        frag_size = max(mtu - 3, 20)  # ATT payload = MTU - 3
+        for i in range(0, len(frame), frag_size):
+            frag = frame[i:i + frag_size]
+            await self._client.write_gatt_char(uuid, frag, response=use_response)
         return await asyncio.wait_for(queue.get(), timeout=timeout)
 
     def _fio_parse_response(self, rx: bytes) -> tuple[int, bytes] | None:
@@ -1274,7 +1373,11 @@ class BLEToolWindow(QMainWindow):
         data       = self._fw_file_data
         total      = len(data)
         chunk_size = self.fw_chunk_spin.value()
-        has_notify = self._fio_has_notify(uuid)
+        notify_uuid = self._fio_find_notify_uuid(uuid)
+        if not notify_uuid:
+            self._log("File write: no notify characteristic found in the same "
+                      "service — cannot receive ACK. Aborting.")
+            return
         loop       = self._async._loop
         self._fw_abort = False
 
@@ -1291,8 +1394,7 @@ class BLEToolWindow(QMainWindow):
                 loop.call_soon_threadsafe(queue.put_nowait, bytes(raw))
 
             try:
-                if has_notify:
-                    await self._client.start_notify(uuid, _notify_cb)
+                await self._client.start_notify(notify_uuid, _notify_cb)
 
                 offset = 0
                 overwrite = True
@@ -1306,34 +1408,27 @@ class BLEToolWindow(QMainWindow):
                     file_pb  = pb_encode_file(device_path, offset, total, chunk)
                     write_pb = pb_encode_file_write(file_pb, overwrite, False)
                     frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
-                    mtu = self._client.mtu_size
-                    if len(frame) > mtu:
-                        raise RuntimeError(
-                            f"Frame {len(frame)} B exceeds MTU {mtu} B — "
-                            f"reduce chunk size to {chunk_size - (len(frame) - mtu)} B or less"
-                        )
 
-                    if has_notify:
-                        rx = await self._fio_transact(uuid, frame, queue, timeout=10.0)
-                        parsed = self._fio_parse_response(rx)
-                        if parsed is None:
-                            raise RuntimeError("Bad proto frame in response")
-                        msg_type, pb = parsed
-                        if msg_type == _PB_MSG_TYPE_FAILURE:
-                            code, msg = pb_decode_failure(pb)
-                            raise RuntimeError(f"Device error code={code}: {msg}")
-                        if msg_type == _PB_MSG_TYPE_FILE:
-                            dec = pb_decode_file(pb)
-                            processed = dec.get("processed_byte") or (offset + len(chunk))
+                    # Send frame (MTU-fragmented) and wait for ACK
+                    rx = await self._fio_transact(uuid, frame, queue, timeout=3.0)
+                    parsed = self._fio_parse_response(rx)
+                    if parsed is None:
+                        raise RuntimeError("Bad proto frame in response")
+                    msg_type, pb = parsed
+                    if msg_type == _PB_MSG_TYPE_FAILURE:
+                        code, msg = pb_decode_failure(pb)
+                        raise RuntimeError(f"Device error code={code}: {msg}")
+                    if msg_type == _PB_MSG_TYPE_FILE:
+                        dec = pb_decode_file(pb)
+                        processed = dec.get("processed_byte")
+                        if processed is not None:
                             offset = processed
                         else:
                             offset += len(chunk)
                     else:
-                        props = self._fio_char_props(uuid)
-                        use_resp = "write-without-response" not in props
-                        await self._client.write_gatt_char(uuid, frame, response=use_resp)
                         offset += len(chunk)
 
+                    # Progress updates only after ACK confirms
                     overwrite = False
                     pct = min(int(offset * 100 / total), 100)
                     self.fw_progress_signal.emit(pct, f"{offset:,} / {total:,} B")
@@ -1345,11 +1440,10 @@ class BLEToolWindow(QMainWindow):
                 self.fw_progress_signal.emit(-1, f"Error: {exc}")
                 self.log_signal.emit(f"File upload error: {exc}")
             finally:
-                if has_notify:
-                    try:
-                        await self._client.stop_notify(uuid)
-                    except Exception:
-                        pass
+                try:
+                    await self._client.stop_notify(notify_uuid)
+                except Exception:
+                    pass
                 self.fw_progress_signal.emit(-2, "")   # sentinel: re-enable buttons
 
         self._async.run(_upload())
@@ -1402,8 +1496,7 @@ class BLEToolWindow(QMainWindow):
         self.btn_pair.setEnabled(False)
         self.btn_ping.setEnabled(False)
         self.lbl_ping_result.setText("")
-        self.ping_char_combo.clear()
-        self.fio_char_combo.clear()
+        self.write_char_combo.clear()
         self.btn_fw_send.setEnabled(False)
         self.fw_progress.setVisible(False)
         self.lbl_fw_status.setText("")
