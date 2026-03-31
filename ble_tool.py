@@ -869,15 +869,6 @@ class BLEToolWindow(QMainWindow):
             if self._client:
                 old = self._client
                 self._client = None
-                # Release maintain_connection before disconnect
-                _be = getattr(old, '_backend', None)
-                if _be:
-                    _ss = getattr(_be, '_session', None)
-                    if _ss:
-                        try:
-                            _ss.maintain_connection = False
-                        except Exception:
-                            pass
                 try:
                     if old.is_connected:
                         self.log_signal.emit("Disconnecting previous session...")
@@ -911,11 +902,6 @@ class BLEToolWindow(QMainWindow):
                 # ---- Connection tuning (WinRT) ----
                 backend = getattr(self._client, '_backend', None)
                 if backend:
-                    # Keep connection active → lower latency scheduling
-                    session = getattr(backend, '_session', None)
-                    if session and getattr(session, 'can_maintain_connection', False):
-                        session.maintain_connection = True
-
                     # Try to request shortest connection interval
                     requester = getattr(backend, '_requester', None)
                     if requester:
@@ -1630,16 +1616,6 @@ class BLEToolWindow(QMainWindow):
 
         async def _disconnect():
             try:
-                # Release maintain_connection so WinRT allows the link
-                # to drop instead of keeping it alive in the background.
-                backend = getattr(client, '_backend', None)
-                if backend:
-                    session = getattr(backend, '_session', None)
-                    if session:
-                        try:
-                            session.maintain_connection = False
-                        except Exception:
-                            pass
                 await asyncio.wait_for(client.disconnect(), timeout=5.0)
                 self.log_signal.emit("Disconnected.")
             except asyncio.TimeoutError:
