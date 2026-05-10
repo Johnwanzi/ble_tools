@@ -109,13 +109,20 @@ _PB_MSG_TYPE_FAILURE         = 60208
 _PB_MSG_TYPE_REBOOT          = 60400
 _PB_MSG_TYPE_FILE            = 60803
 _PB_MSG_TYPE_FILEWRITE       = 60805
-_PB_MSG_TYPE_FIRMWARE_UPDATE = 61000
+_PB_MSG_TYPE_FIRMWARE_UPDATE            = 61000
+_PB_MSG_TYPE_GET_FIRMWARE_UPDATE_STATUS = 61002
+_PB_MSG_TYPE_FIRMWARE_UPDATE_STATUS     = 61003
 _PB_MSG_NAMES = {
     60206: "Ping", 60207: "Success", 60208: "Failure",
     60400: "Reboot",
     60803: "File", 60805: "FileWrite",
     61000: "FirmwareUpdate",
+    61002: "GetFirmwareUpdateStatus",
+    61003: "FirmwareUpdateStatus",
 }
+
+# DevFirmwareUpdateStatusEntry.status
+_FW_UPDATE_STATUS_NAMES = {0: "finished", 1: "in_progress", 2: "failed"}
 
 # Reboot.RebootType
 _REBOOT_TYPE_NORMAL      = 0
@@ -352,6 +359,55 @@ def pb_encode_firmware_update(targets: list[tuple[int, str]],
     return result
 
 
+def pb_encode_get_firmware_update_status() -> bytes:
+    """Encode  DevGetFirmwareUpdateStatus { }  (no fields)."""
+    return b""
+
+
+def pb_decode_firmware_update_status_entry(pb: bytes) -> dict:
+    """Decode  DevFirmwareUpdateStatusEntry { target_id=1 (uint32), status=2 (uint32) }."""
+    result = {"target_id": 0, "status": 0}
+    offset = 0
+    while offset < len(pb):
+        tag, offset = _decode_varint(pb, offset)
+        fn, wt = tag >> 3, tag & 0x7
+        if wt == 0:
+            val, offset = _decode_varint(pb, offset)
+            if fn == 1:   result["target_id"] = val
+            elif fn == 2: result["status"] = val
+        elif wt == 2:
+            ln, offset = _decode_varint(pb, offset)
+            offset += ln  # skip unknown length-delimited
+        else:
+            break
+    return result
+
+
+def pb_decode_firmware_update_status(pb: bytes) -> list[dict]:
+    """Decode  DevFirmwareUpdateStatus { repeated DevFirmwareUpdateStatusEntry targets=1 }.
+
+    Returns a list of {"target_id", "status"} dicts.
+    """
+    targets: list[dict] = []
+    offset = 0
+    while offset < len(pb):
+        tag, offset = _decode_varint(pb, offset)
+        fn, wt = tag >> 3, tag & 0x7
+        if fn == 1 and wt == 2:
+            ln, offset = _decode_varint(pb, offset)
+            entry = pb_decode_firmware_update_status_entry(pb[offset:offset + ln])
+            targets.append(entry)
+            offset += ln
+        elif wt == 0:
+            _, offset = _decode_varint(pb, offset)
+        elif wt == 2:
+            ln, offset = _decode_varint(pb, offset)
+            offset += ln
+        else:
+            break
+    return targets
+
+
 
 def pb_decode_file(pb: bytes) -> dict:
     """Decode  File { path=1, offset=2, total_size=3, data=4, processed_byte=6 }"""
@@ -473,6 +529,7 @@ class BLEToolWindow(QMainWindow):
     fw_progress_signal = pyqtSignal(int, str)      # percent 0-100, status text
     reboot_result_signal = pyqtSignal(bool, str)        # success, result_text
     fw_update_result_signal = pyqtSignal(bool, str)     # success, result_text
+    fw_status_result_signal = pyqtSignal(bool, str)     # success, result_text
 
     def __init__(self):
         super().__init__()
@@ -775,6 +832,34 @@ class BLEToolWindow(QMainWindow):
 
         self.proto_tabs.addTab(fwu_tab, "FW Update")
 
+        # -- FW Status tab (DevGetFirmwareUpdateStatus) --
+        fws_tab = QWidget()
+        fws_lay = QVBoxLayout(fws_tab)
+        fws_lay.setContentsMargins(4, 8, 4, 4)
+        fws_lay.setSpacing(4)
+
+        fws_btn_bar = QHBoxLayout()
+        fws_btn_bar.addWidget(QLabel(
+            "Query last firmware update record (DevGetFirmwareUpdateStatus)"))
+        fws_btn_bar.addStretch()
+        self.btn_fws_query = QPushButton("Query Status")
+        self.btn_fws_query.setMinimumHeight(28)
+        self.btn_fws_query.setEnabled(False)
+        fws_btn_bar.addWidget(self.btn_fws_query)
+        fws_lay.addLayout(fws_btn_bar)
+
+        self.fws_result_text = QTextEdit()
+        self.fws_result_text.setReadOnly(True)
+        self.fws_result_text.setFont(QFont("Consolas", 9))
+        self.fws_result_text.setFixedHeight(110)
+        self.fws_result_text.setStyleSheet(
+            "QTextEdit { background: #1a1a1a; color: #eee; "
+            "border: 1px solid #444; border-radius: 4px; "
+            "font-family: monospace; font-size: 11px; }")
+        fws_lay.addWidget(self.fws_result_text)
+
+        self.proto_tabs.addTab(fws_tab, "FW Status")
+
         # -- Reboot tab --
         reboot_tab = QWidget()
         reboot_lay = QVBoxLayout(reboot_tab)
@@ -852,6 +937,8 @@ class BLEToolWindow(QMainWindow):
         self.reboot_result_signal.connect(self._on_reboot_result)
         self.btn_fwu_send.clicked.connect(self._on_fw_update)
         self.fw_update_result_signal.connect(self._on_fw_update_result)
+        self.btn_fws_query.clicked.connect(self._on_fw_status)
+        self.fw_status_result_signal.connect(self._on_fw_status_result)
 
     # ---- Logging ----------------------------------------------------------
 
@@ -1074,6 +1161,7 @@ class BLEToolWindow(QMainWindow):
             self.btn_fw_send.setEnabled(True)
             self.btn_reboot.setEnabled(True)
             self.btn_fwu_send.setEnabled(True)
+            self.btn_fws_query.setEnabled(True)
             if HAS_DBUS:
                 self.btn_pair.setEnabled(True)
         else:
@@ -1413,12 +1501,18 @@ class BLEToolWindow(QMainWindow):
     def _send_pb_command(self, msg_type: int, pb_payload: bytes,
                          result_signal: pyqtSignal, *,
                          timeout: float = 5.0,
-                         label: str = "Command") -> bool:
+                         label: str = "Command",
+                         extra_decoders: dict | None = None) -> bool:
         """Send a Proto V0 / pb command and emit (success, text) on *result_signal*.
 
         Returns False synchronously if the request could not be dispatched
         (no client / no write characteristic / no notify char in service);
         otherwise the asynchronous result is delivered via *result_signal*.
+
+        *extra_decoders* maps  rx_msg_type -> callable(pb_bytes) -> str  for
+        commands whose success response is not a generic  Success  message
+        (e.g. DevFirmwareUpdateStatus).  When the rx msg type matches, the
+        decoder's return string is emitted with success=True.
         """
         if not self._client:
             self._log(f"{label}: not connected.")
@@ -1470,7 +1564,19 @@ class BLEToolWindow(QMainWindow):
 
                 rx_type, pb = parsed
                 rx_name = _PB_MSG_NAMES.get(rx_type, f"Unknown({rx_type})")
-                if rx_type == _PB_MSG_TYPE_SUCCESS:
+                if extra_decoders and rx_type in extra_decoders:
+                    try:
+                        decoded = extra_decoders[rx_type](pb)
+                    except Exception as exc:
+                        self.log_signal.emit(
+                            f"{label} decode error for {rx_name}: {exc}")
+                        result_signal.emit(False, f"Decode error: {exc}")
+                        return
+                    self.log_signal.emit(
+                        f"{label} OK  msg_type={rx_type} ({rx_name})  "
+                        f"response={decoded}")
+                    result_signal.emit(True, decoded)
+                elif rx_type == _PB_MSG_TYPE_SUCCESS:
                     decoded = pb_decode_success(pb)
                     self.log_signal.emit(
                         f"{label} OK  msg_type={rx_type} ({rx_name})  "
@@ -1560,6 +1666,51 @@ class BLEToolWindow(QMainWindow):
         color = "#2ecc71" if success else "#e74c3c"
         self.lbl_fwu_result.setText(f'<span style="color:{color}">{text}</span>')
         self.btn_fwu_send.setEnabled(self._client is not None)
+
+    # ---- Firmware Update Status (DevGetFirmwareUpdateStatus) ---------------
+
+    @staticmethod
+    def _format_fw_update_status(pb: bytes) -> str:
+        entries = pb_decode_firmware_update_status(pb)
+        if not entries:
+            return "FirmwareUpdateStatus: (no targets)"
+        lines = ["FirmwareUpdateStatus:"]
+        for e in entries:
+            tid = e["target_id"]
+            st = e["status"]
+            t_name = _FW_TARGET_NAMES.get(tid, f"target {tid}")
+            s_name = _FW_UPDATE_STATUS_NAMES.get(st, f"status {st}")
+            lines.append(f"  • {t_name} ({tid}) → {s_name} ({st})")
+        return "\n".join(lines)
+
+    def _on_fw_status(self):
+        pb_payload = pb_encode_get_firmware_update_status()
+        self.fws_result_text.setPlainText("Querying…")
+        self.btn_fws_query.setEnabled(False)
+        ok = self._send_pb_command(
+            _PB_MSG_TYPE_GET_FIRMWARE_UPDATE_STATUS, pb_payload,
+            self.fw_status_result_signal, timeout=5.0,
+            label="GetFwUpdateStatus",
+            extra_decoders={
+                _PB_MSG_TYPE_FIRMWARE_UPDATE_STATUS: self._format_fw_update_status,
+            })
+        if not ok:
+            self.btn_fws_query.setEnabled(True)
+            self.fws_result_text.clear()
+
+    def _on_fw_status_result(self, success: bool, text: str):
+        self.fws_result_text.setPlainText(text)
+        if not success:
+            self.fws_result_text.setStyleSheet(
+                "QTextEdit { background: #1a1a1a; color: #e74c3c; "
+                "border: 1px solid #e74c3c; border-radius: 4px; "
+                "font-family: monospace; font-size: 11px; }")
+        else:
+            self.fws_result_text.setStyleSheet(
+                "QTextEdit { background: #1a1a1a; color: #2ecc71; "
+                "border: 1px solid #2ecc71; border-radius: 4px; "
+                "font-family: monospace; font-size: 11px; }")
+        self.btn_fws_query.setEnabled(self._client is not None)
 
     # ---- File I/O (Proto V0) ------------------------------------------------
 
@@ -1855,8 +2006,10 @@ class BLEToolWindow(QMainWindow):
         self.btn_fw_send.setEnabled(False)
         self.btn_reboot.setEnabled(False)
         self.btn_fwu_send.setEnabled(False)
+        self.btn_fws_query.setEnabled(False)
         self.lbl_reboot_result.setText("")
         self.lbl_fwu_result.setText("")
+        self.fws_result_text.clear()
         self.fw_progress.setVisible(False)
         self.lbl_fw_status.setText("")
         self.fw_file_info.clear()
