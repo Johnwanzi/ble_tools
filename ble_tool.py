@@ -109,12 +109,15 @@ _PB_MSG_TYPE_FAILURE         = 60208
 _PB_MSG_TYPE_REBOOT          = 60400
 _PB_MSG_TYPE_FILE            = 60803
 _PB_MSG_TYPE_FILEWRITE       = 60805
+_PB_MSG_TYPE_GET_DEVICE_INFO            = 60600
+_PB_MSG_TYPE_DEVICE_INFO                = 60601
 _PB_MSG_TYPE_FIRMWARE_UPDATE            = 61000
 _PB_MSG_TYPE_GET_FIRMWARE_UPDATE_STATUS = 61002
 _PB_MSG_TYPE_FIRMWARE_UPDATE_STATUS     = 61003
 _PB_MSG_NAMES = {
     60206: "Ping", 60207: "Success", 60208: "Failure",
     60400: "Reboot",
+    60600: "GetDeviceInfo", 60601: "DeviceInfo",
     60803: "File", 60805: "FileWrite",
     61000: "FirmwareUpdate",
     61002: "GetFirmwareUpdateStatus",
@@ -123,6 +126,14 @@ _PB_MSG_NAMES = {
 
 # DevFirmwareUpdateStatusEntry.status
 _FW_UPDATE_STATUS_NAMES = {0: "finished", 1: "in_progress", 2: "failed"}
+
+# DeviceInfo-related enums
+_DEVICE_TYPE_NAMES = {
+    0x00: "CLASSIC1", 0x01: "CLASSIC1S", 0x02: "MINI",
+    0x03: "TOUCH", 0x05: "PRO", 0x06: "CLASSIC1S_PURE",
+}
+_SE_TYPE_NAMES = {0x00: "THD89", 0x01: "SE608A"}
+_SE_STATE_NAMES = {0x00: "BOOT", 0x33: "APP_FACTORY", 0x55: "APP"}
 
 # Reboot.RebootType
 _REBOOT_TYPE_NORMAL      = 0
@@ -408,6 +419,189 @@ def pb_decode_firmware_update_status(pb: bytes) -> list[dict]:
     return targets
 
 
+# ---------------------------------------------------------------------------
+# DeviceInfo (DevGetDeviceInfo request / DeviceInfo response)
+# ---------------------------------------------------------------------------
+
+def pb_encode_dev_info_targets(hw=True, fw=True, bt=True,
+                               se1=True, se2=True, se3=True, se4=True,
+                               status=True) -> bytes:
+    """Encode  DevInfoTargets { hw=100, fw=200, bt=300, se1=400, se2=410,
+    se3=420, se4=430, status=10000 }  (all optional bool)."""
+    out = b""
+    for fnum, flag in (
+        (100, hw), (200, fw), (300, bt),
+        (400, se1), (410, se2), (420, se3), (430, se4),
+        (10000, status),
+    ):
+        if flag:
+            out += _encode_pb_bool(fnum, True)
+    return out
+
+
+def pb_encode_dev_info_types(version=True, build_id=True,
+                             hash_=True, specific=True) -> bytes:
+    """Encode  DevInfoTypes { version=10, build_id=20, hash=30, specific=40 }."""
+    out = b""
+    for fnum, flag in ((10, version), (20, build_id), (30, hash_), (40, specific)):
+        if flag:
+            out += _encode_pb_bool(fnum, True)
+    return out
+
+
+def pb_encode_get_device_info(targets_pb: bytes, types_pb: bytes) -> bytes:
+    """Encode  DevGetDeviceInfo { targets=1 (DevInfoTargets); types=2 (DevInfoTypes); }."""
+    out = b""
+    if targets_pb:
+        out += _encode_pb_message(1, targets_pb)
+    if types_pb:
+        out += _encode_pb_message(2, types_pb)
+    return out
+
+
+def _pb_walk(pb: bytes):
+    """Yield (field_num, wire_type, value) for each field in a protobuf blob.
+
+    For wire_type 0 (varint) value is int; for wire_type 2 value is bytes;
+    other wire types are skipped (these messages use only 0 and 2).
+    """
+    offset = 0
+    n = len(pb)
+    while offset < n:
+        tag, offset = _decode_varint(pb, offset)
+        fn, wt = tag >> 3, tag & 0x7
+        if wt == 0:
+            val, offset = _decode_varint(pb, offset)
+            yield fn, wt, val
+        elif wt == 2:
+            ln, offset = _decode_varint(pb, offset)
+            chunk = bytes(pb[offset:offset + ln]); offset += ln
+            yield fn, wt, chunk
+        elif wt == 5:
+            offset += 4
+        elif wt == 1:
+            offset += 8
+        else:
+            break
+
+
+def pb_decode_firmware_image_info(pb: bytes) -> dict:
+    """Decode  DevFirmwareImageInfo { version=10, build_id=20, hash=30(bytes) }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if fn == 10 and wt == 2:
+            result["version"] = val.decode("utf-8", errors="replace")
+        elif fn == 20 and wt == 2:
+            result["build_id"] = val.decode("utf-8", errors="replace")
+        elif fn == 30 and wt == 2:
+            result["hash"] = val.hex()
+    return result
+
+
+def pb_decode_hardware_info(pb: bytes) -> dict:
+    """Decode  DevHardwareInfo { device_type=10, serial_no=11,
+    hardware_version=100, hardware_version_raw_adc=101 }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if fn == 10 and wt == 0:
+            result["device_type"] = _DEVICE_TYPE_NAMES.get(val, f"Unknown({val})")
+        elif fn == 11 and wt == 2:
+            result["serial_no"] = val.decode("utf-8", errors="replace")
+        elif fn == 100 and wt == 2:
+            result["hardware_version"] = val.decode("utf-8", errors="replace")
+        elif fn == 101 and wt == 0:
+            result["hardware_version_raw_adc"] = val
+    return result
+
+
+def pb_decode_main_mcu_info(pb: bytes) -> dict:
+    """Decode  DevMainMcuInfo { board=10, boot=20, app=30 }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if wt != 2:
+            continue
+        if fn == 10:   result["board"] = pb_decode_firmware_image_info(val)
+        elif fn == 20: result["boot"] = pb_decode_firmware_image_info(val)
+        elif fn == 30: result["app"] = pb_decode_firmware_image_info(val)
+    return result
+
+
+def pb_decode_bluetooth_info(pb: bytes) -> dict:
+    """Decode  DevBluetoothInfo { boot=20, app=30, adv_name=100, mac=110(bytes) }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if fn == 20 and wt == 2:
+            result["boot"] = pb_decode_firmware_image_info(val)
+        elif fn == 30 and wt == 2:
+            result["app"] = pb_decode_firmware_image_info(val)
+        elif fn == 100 and wt == 2:
+            result["adv_name"] = val.decode("utf-8", errors="replace")
+        elif fn == 110 and wt == 2:
+            result["mac"] = ":".join(f"{b:02X}" for b in val)
+    return result
+
+
+def pb_decode_se_info(pb: bytes) -> dict:
+    """Decode  DevSEInfo { boot=20, app=30, type=100(enum), state=110(enum) }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if fn == 20 and wt == 2:
+            result["boot"] = pb_decode_firmware_image_info(val)
+        elif fn == 30 and wt == 2:
+            result["app"] = pb_decode_firmware_image_info(val)
+        elif fn == 100 and wt == 0:
+            result["type"] = _SE_TYPE_NAMES.get(val, f"Unknown({val})")
+        elif fn == 110 and wt == 0:
+            result["state"] = _SE_STATE_NAMES.get(val, f"Unknown({val})")
+    return result
+
+
+def pb_decode_dev_status(pb: bytes) -> dict:
+    """Decode  DevStatus { language=100, bt_enable=101, init_states=102,
+    backup_required=200, passphrase_protection=201, label=300 }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if fn == 100 and wt == 2:
+            result["language"] = val.decode("utf-8", errors="replace")
+        elif fn == 101 and wt == 0:
+            result["bt_enable"] = val != 0
+        elif fn == 102 and wt == 0:
+            result["init_states"] = val != 0
+        elif fn == 200 and wt == 0:
+            result["backup_required"] = val != 0
+        elif fn == 201 and wt == 0:
+            result["passphrase_protection"] = val != 0
+        elif fn == 300 and wt == 2:
+            result["label"] = val.decode("utf-8", errors="replace")
+    return result
+
+
+def pb_decode_device_info(pb: bytes) -> dict:
+    """Decode  DeviceInfo { protocol_version=1, hw=100, fw=200, bt=300,
+    se1=400, se2=410, se3=420, se4=430, status=10000 }."""
+    result = {}
+    for fn, wt, val in _pb_walk(pb):
+        if fn == 1 and wt == 0:
+            result["protocol_version"] = val
+        elif fn == 100 and wt == 2:
+            result["hw"] = pb_decode_hardware_info(val)
+        elif fn == 200 and wt == 2:
+            result["fw"] = pb_decode_main_mcu_info(val)
+        elif fn == 300 and wt == 2:
+            result["bt"] = pb_decode_bluetooth_info(val)
+        elif fn == 400 and wt == 2:
+            result["se1"] = pb_decode_se_info(val)
+        elif fn == 410 and wt == 2:
+            result["se2"] = pb_decode_se_info(val)
+        elif fn == 420 and wt == 2:
+            result["se3"] = pb_decode_se_info(val)
+        elif fn == 430 and wt == 2:
+            result["se4"] = pb_decode_se_info(val)
+        elif fn == 10000 and wt == 2:
+            result["status"] = pb_decode_dev_status(val)
+    return result
+
+
 
 def pb_decode_file(pb: bytes) -> dict:
     """Decode  File { path=1, offset=2, total_size=3, data=4, processed_byte=6 }"""
@@ -530,6 +724,7 @@ class BLEToolWindow(QMainWindow):
     reboot_result_signal = pyqtSignal(bool, str)        # success, result_text
     fw_update_result_signal = pyqtSignal(bool, str)     # success, result_text
     fw_status_result_signal = pyqtSignal(bool, str)     # success, result_text
+    device_info_result_signal = pyqtSignal(bool, str)   # success, result_text
 
     def __init__(self):
         super().__init__()
@@ -794,6 +989,55 @@ class BLEToolWindow(QMainWindow):
 
         self.proto_tabs.addTab(fw_tab, "File Write")
 
+        # -- Device Info tab (DevGetDeviceInfo / DeviceInfo) --
+        di_tab = QWidget()
+        di_lay = QVBoxLayout(di_tab)
+        di_lay.setContentsMargins(4, 8, 4, 4)
+        di_lay.setSpacing(4)
+
+        # targets checkboxes
+        di_lay.addWidget(QLabel("Targets:"))
+        di_targets_grid = QHBoxLayout()
+        self.di_target_chks: dict[str, QCheckBox] = {}
+        for key, text in (("hw", "HW"), ("fw", "FW"), ("bt", "BT"),
+                          ("se1", "SE1"), ("se2", "SE2"),
+                          ("se3", "SE3"), ("se4", "SE4"),
+                          ("status", "Status")):
+            chk = QCheckBox(text)
+            chk.setChecked(True)
+            self.di_target_chks[key] = chk
+            di_targets_grid.addWidget(chk)
+        di_targets_grid.addStretch()
+        di_lay.addLayout(di_targets_grid)
+
+        # types checkboxes
+        di_lay.addWidget(QLabel("Info types:"))
+        di_types_grid = QHBoxLayout()
+        self.di_type_chks: dict[str, QCheckBox] = {}
+        for key, text in (("version", "version"), ("build_id", "build_id"),
+                          ("hash", "hash"), ("specific", "specific")):
+            chk = QCheckBox(text)
+            chk.setChecked(True)
+            self.di_type_chks[key] = chk
+            di_types_grid.addWidget(chk)
+        di_types_grid.addStretch()
+        self.btn_di_query = QPushButton("Get Device Info")
+        self.btn_di_query.setMinimumHeight(28)
+        self.btn_di_query.setEnabled(False)
+        di_types_grid.addWidget(self.btn_di_query)
+        di_lay.addLayout(di_types_grid)
+
+        self.di_result_text = QTextEdit()
+        self.di_result_text.setReadOnly(True)
+        self.di_result_text.setFont(QFont("Consolas", 9))
+        self.di_result_text.setStyleSheet(
+            "QTextEdit { background: #1a1a1a; color: #eee; "
+            "border: 1px solid #444; border-radius: 4px; "
+            "font-family: monospace; font-size: 11px; }")
+        di_lay.addWidget(self.di_result_text)
+
+        self.proto_tabs.addTab(di_tab, "Device Info")
+
         # -- FW Update tab --
         fwu_tab = QWidget()
         fwu_lay = QVBoxLayout(fwu_tab)
@@ -939,6 +1183,8 @@ class BLEToolWindow(QMainWindow):
         self.fw_update_result_signal.connect(self._on_fw_update_result)
         self.btn_fws_query.clicked.connect(self._on_fw_status)
         self.fw_status_result_signal.connect(self._on_fw_status_result)
+        self.btn_di_query.clicked.connect(self._on_device_info)
+        self.device_info_result_signal.connect(self._on_device_info_result)
 
     # ---- Logging ----------------------------------------------------------
 
@@ -1162,6 +1408,7 @@ class BLEToolWindow(QMainWindow):
             self.btn_reboot.setEnabled(True)
             self.btn_fwu_send.setEnabled(True)
             self.btn_fws_query.setEnabled(True)
+            self.btn_di_query.setEnabled(True)
             if HAS_DBUS:
                 self.btn_pair.setEnabled(True)
         else:
@@ -1712,6 +1959,104 @@ class BLEToolWindow(QMainWindow):
                 "font-family: monospace; font-size: 11px; }")
         self.btn_fws_query.setEnabled(self._client is not None)
 
+    # ---- Device Info (DevGetDeviceInfo / DeviceInfo) ----------------------
+
+    @staticmethod
+    def _format_device_info(pb: bytes) -> str:
+        info = pb_decode_device_info(pb)
+        lines: list[str] = ["DeviceInfo:"]
+
+        if "protocol_version" in info:
+            lines.append(f"  protocol_version: {info['protocol_version']}")
+
+        def _img(prefix: str, img: dict):
+            parts = []
+            if img.get("version"):  parts.append(f"v={img['version']}")
+            if img.get("build_id"): parts.append(f"build={img['build_id']}")
+            if img.get("hash"):     parts.append(f"hash={img['hash']}")
+            lines.append(f"    {prefix}: {', '.join(parts) if parts else '-'}")
+
+        hw = info.get("hw")
+        if hw:
+            lines.append("  HW:")
+            if "device_type" in hw:        lines.append(f"    device_type: {hw['device_type']}")
+            if "serial_no" in hw:          lines.append(f"    serial_no: {hw['serial_no']}")
+            if "hardware_version" in hw:   lines.append(f"    hardware_version: {hw['hardware_version']}")
+            if "hardware_version_raw_adc" in hw:
+                lines.append(f"    hw_version_raw_adc: {hw['hardware_version_raw_adc']}")
+
+        fw = info.get("fw")
+        if fw:
+            lines.append("  FW (Main MCU):")
+            for k in ("board", "boot", "app"):
+                if k in fw:
+                    _img(k, fw[k])
+
+        bt = info.get("bt")
+        if bt:
+            lines.append("  BT:")
+            if "adv_name" in bt: lines.append(f"    adv_name: {bt['adv_name']}")
+            if "mac" in bt:      lines.append(f"    mac: {bt['mac']}")
+            for k in ("boot", "app"):
+                if k in bt:
+                    _img(k, bt[k])
+
+        for se_key in ("se1", "se2", "se3", "se4"):
+            se = info.get(se_key)
+            if se:
+                lines.append(f"  {se_key.upper()}:")
+                if "type" in se:  lines.append(f"    type: {se['type']}")
+                if "state" in se: lines.append(f"    state: {se['state']}")
+                for k in ("boot", "app"):
+                    if k in se:
+                        _img(k, se[k])
+
+        st = info.get("status")
+        if st:
+            lines.append("  Status:")
+            for key, label in (
+                ("language", "language"), ("label", "label"),
+                ("bt_enable", "bt_enable"), ("init_states", "init_states"),
+                ("backup_required", "backup_required"),
+                ("passphrase_protection", "passphrase_protection"),
+            ):
+                if key in st:
+                    lines.append(f"    {label}: {st[key]}")
+
+        return "\n".join(lines)
+
+    def _on_device_info(self):
+        targets_pb = pb_encode_dev_info_targets(
+            **{k: chk.isChecked() for k, chk in self.di_target_chks.items()})
+        types_pb = pb_encode_dev_info_types(
+            version=self.di_type_chks["version"].isChecked(),
+            build_id=self.di_type_chks["build_id"].isChecked(),
+            hash_=self.di_type_chks["hash"].isChecked(),
+            specific=self.di_type_chks["specific"].isChecked())
+        pb_payload = pb_encode_get_device_info(targets_pb, types_pb)
+
+        self.di_result_text.setPlainText("Querying…")
+        self.btn_di_query.setEnabled(False)
+        ok = self._send_pb_command(
+            _PB_MSG_TYPE_GET_DEVICE_INFO, pb_payload,
+            self.device_info_result_signal, timeout=8.0,
+            label="GetDeviceInfo",
+            extra_decoders={
+                _PB_MSG_TYPE_DEVICE_INFO: self._format_device_info,
+            })
+        if not ok:
+            self.btn_di_query.setEnabled(True)
+            self.di_result_text.clear()
+
+    def _on_device_info_result(self, success: bool, text: str):
+        self.di_result_text.setPlainText(text)
+        color = "#2ecc71" if success else "#e74c3c"
+        self.di_result_text.setStyleSheet(
+            f"QTextEdit {{ background: #1a1a1a; color: {color}; "
+            f"border: 1px solid {color}; border-radius: 4px; "
+            f"font-family: monospace; font-size: 11px; }}")
+        self.btn_di_query.setEnabled(self._client is not None)
+
     # ---- File I/O (Proto V0) ------------------------------------------------
 
     def _fio_uuid(self) -> str | None:
@@ -2007,9 +2352,11 @@ class BLEToolWindow(QMainWindow):
         self.btn_reboot.setEnabled(False)
         self.btn_fwu_send.setEnabled(False)
         self.btn_fws_query.setEnabled(False)
+        self.btn_di_query.setEnabled(False)
         self.lbl_reboot_result.setText("")
         self.lbl_fwu_result.setText("")
         self.fws_result_text.clear()
+        self.di_result_text.clear()
         self.fw_progress.setVisible(False)
         self.lbl_fw_status.setText("")
         self.fw_file_info.clear()
