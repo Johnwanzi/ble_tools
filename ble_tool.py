@@ -785,10 +785,10 @@ class BLEToolWindow(QMainWindow):
 
         # RSSI filter
         rssi_bar = QHBoxLayout()
-        rssi_bar.addWidget(QLabel("RSSI ≥"))
+        rssi_bar.addWidget(QLabel("RSSI >"))
         self.rssi_filter = QSpinBox()
         self.rssi_filter.setRange(-120, 0)
-        self.rssi_filter.setValue(-60)
+        self.rssi_filter.setValue(-70)
         self.rssi_filter.setSuffix(" dBm")
         self.rssi_filter.setToolTip("Only show devices with RSSI above this threshold")
         rssi_bar.addWidget(self.rssi_filter)
@@ -956,9 +956,9 @@ class BLEToolWindow(QMainWindow):
         fw_chunk_bar = QHBoxLayout()
         fw_chunk_bar.addWidget(QLabel("Chunk:"))
         self.fw_chunk_spin = QSpinBox()
-        self.fw_chunk_spin.setRange(16, 2048)
+        self.fw_chunk_spin.setRange(16, 1800)
         self.fw_chunk_spin.setSingleStep(64)
-        self.fw_chunk_spin.setValue(2048)
+        self.fw_chunk_spin.setValue(1800)
         self.fw_chunk_spin.setSuffix(" B")
         self.fw_chunk_spin.setToolTip("Auto-set to MTU-derived max after connection")
         fw_chunk_bar.addWidget(self.fw_chunk_spin)
@@ -1257,7 +1257,7 @@ class BLEToolWindow(QMainWindow):
         rssi_threshold = self.rssi_filter.value()
         count = 0
         for dev in sorted_devices:
-            if dev.rssi < rssi_threshold:
+            if dev.rssi <= rssi_threshold:
                 continue
             if filter_text:
                 if filter_text not in dev.name.lower() and filter_text not in dev.address.lower():
@@ -1392,10 +1392,10 @@ class BLEToolWindow(QMainWindow):
         mtu = self._negotiated_mtu
         if mtu <= 0:
             return
-        self.fw_chunk_spin.setRange(16, 2048)
+        self.fw_chunk_spin.setRange(16, 1800)
         self.fw_chunk_spin.setSingleStep(64)
-        self.fw_chunk_spin.setValue(2048)
-        self.lbl_chunk_mtu.setText(f"(MTU {mtu}, chunk max 2048 B)")
+        self.fw_chunk_spin.setValue(1800)
+        self.lbl_chunk_mtu.setText(f"(MTU {mtu}, chunk max 1800 B)")
 
     def _on_connection_done(self, success: bool, msg: str):
         self._log(msg)
