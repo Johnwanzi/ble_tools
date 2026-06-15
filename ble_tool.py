@@ -25,6 +25,7 @@ from bleak.backends.scanner import AdvertisementData
 
 # Check if we're on Linux for dbus support
 IS_LINUX = platform.system() == 'Linux'
+BLE_RELEASE_DELAY_S = 1.0
 
 if IS_LINUX:
     try:
@@ -737,7 +738,9 @@ class BLEToolWindow(QMainWindow):
         self._scanner = None
         self._client: BleakClient | None = None
         self._connected_address: str | None = None
+        self._disconnecting = False
         self._notifying: set[str] = set()  # UUIDs currently subscribed
+        self._service_baseline: dict[str, tuple[int, int]] = {}  # address -> (services, chars)
         self._pairing_result: bool | None = None
         self._fw_file_data: bytes | None = None   # local file to upload
         self._fw_abort = False
@@ -1285,6 +1288,9 @@ class BLEToolWindow(QMainWindow):
     # ---- Connection & Service Discovery ------------------------------------
 
     def _on_connect(self):
+        if self._disconnecting:
+            self._log("Previous disconnect is still settling; retry in a moment.")
+            return
         selected = self.device_tree.currentItem()
         if not selected:
             self._log("No device selected.")
@@ -1309,6 +1315,8 @@ class BLEToolWindow(QMainWindow):
                 except Exception:
                     pass
                 self._scanner = None
+                self._scanning = False
+                QTimer.singleShot(0, lambda: self.btn_scan.setText("Start Scan"))
 
             # Force-disconnect any previous client so the Windows BLE
             # stack releases all handles and clears the GATT cache.
@@ -1324,25 +1332,59 @@ class BLEToolWindow(QMainWindow):
                 del old
                 # Give Windows time to fully release the BLE radio handle
                 # and flush the GATT cache before creating a new session.
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(BLE_RELEASE_DELAY_S)
 
             try:
-                def _disconnected_cb(client: BleakClient):
-                    if self._client is not client:
-                        return
-                    self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
+                async def _connect_once() -> tuple[BleakClient, object, tuple[int, int]]:
+                    def _disconnected_cb(client: BleakClient):
+                        if self._client is not client:
+                            return
+                        self.disconnected_signal.emit(f"Device disconnected: {name} ({address})")
 
-                self._client = BleakClient(
-                    ble_device,
-                    disconnected_callback=_disconnected_cb,
-                    winrt={"use_cached_services": False},
+                    client = BleakClient(
+                        ble_device,
+                        disconnected_callback=_disconnected_cb,
+                        winrt={"use_cached_services": False},
+                    )
+                    # Set retry flag on the WinRT *backend* so that when
+                    # services_changed events fire during reconnect, service
+                    # discovery is restarted until the list stabilises.
+                    if hasattr(client, '_backend'):
+                        client._backend._retry_on_services_changed = True
+                    await client.connect()
+                    services = client.services
+                    counts = self._service_counts(services)
+                    return client, services, counts
+
+                baseline = self._service_baseline.get(address)
+                services = None
+                counts = (0, 0)
+                for attempt in range(2):
+                    self._client, services, counts = await _connect_once()
+                    if not baseline or counts[0] >= baseline[0] and counts[1] >= baseline[1]:
+                        break
+
+                    self.log_signal.emit(
+                        "Service discovery looks incomplete "
+                        f"({counts[0]} services/{counts[1]} chars, expected at least "
+                        f"{baseline[0]}/{baseline[1]}). Retrying...")
+                    retry_client = self._client
+                    self._client = None
+                    try:
+                        await asyncio.wait_for(retry_client.disconnect(), timeout=5.0)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(BLE_RELEASE_DELAY_S)
+                else:
+                    self.log_signal.emit(
+                        "Service discovery is still below the previous baseline; "
+                        "showing the latest result.")
+
+                old_baseline = self._service_baseline.get(address, (0, 0))
+                self._service_baseline[address] = (
+                    max(old_baseline[0], counts[0]),
+                    max(old_baseline[1], counts[1]),
                 )
-                # Set retry flag on the WinRT *backend* so that when
-                # services_changed events fire during reconnect, service
-                # discovery is restarted until the list stabilises.
-                if hasattr(self._client, '_backend'):
-                    self._client._backend._retry_on_services_changed = True
-                await self._client.connect()
                 self._connected_address = address
 
                 # ---- Connection tuning (WinRT) ----
@@ -1373,14 +1415,21 @@ class BLEToolWindow(QMainWindow):
 
                 mtu = self._client.mtu_size
                 self.connection_done.emit(True, f"Connected to {name} ({address})  MTU={mtu}")
-                services = self._client.services
                 self.services_discovered.emit(services)
                 self.log_signal.emit(f"MTU negotiated: {mtu}")
                 QTimer.singleShot(0, lambda m=mtu: self._apply_mtu(m))
             except Exception as e:
+                self._client = None
+                self._connected_address = None
                 self.connection_done.emit(False, f"Connection failed: {e}")
 
         self._async.run(_connect())
+
+    @staticmethod
+    def _service_counts(services) -> tuple[int, int]:
+        """Return service and characteristic counts for reconnect sanity checks."""
+        service_list = list(services)
+        return len(service_list), sum(len(service.characteristics) for service in service_list)
 
     def _apply_mtu(self, mtu: int):
         """Store negotiated MTU and update the chunk-size UI hint."""
@@ -2336,13 +2385,13 @@ class BLEToolWindow(QMainWindow):
 
         self._async.run(_pair())
 
-    def _reset_connection_ui(self):
+    def _reset_connection_ui(self, *, connect_enabled: bool = True):
         """Reset all UI state to disconnected. Safe to call from any context."""
         self.lbl_conn.setText("Not connected")
         # Sync scan button in case the scanner was stopped internally during connect
         if not self._scanning:
             self.btn_scan.setText("Start Scan")
-        self.btn_connect.setEnabled(True)
+        self.btn_connect.setEnabled(connect_enabled)
         self.btn_disconnect.setEnabled(False)
         self.btn_pair.setEnabled(False)
         self.btn_ping.setEnabled(False)
@@ -2372,7 +2421,9 @@ class BLEToolWindow(QMainWindow):
         self._log(f"[!] {reason}")
         self._client = None
         self._connected_address = None
-        self._reset_connection_ui()
+        self._disconnecting = True
+        self._reset_connection_ui(connect_enabled=False)
+        QTimer.singleShot(int(BLE_RELEASE_DELAY_S * 1000), self._mark_disconnect_ready)
 
     def _on_disconnect(self):
         if not self._client:
@@ -2381,7 +2432,8 @@ class BLEToolWindow(QMainWindow):
         client = self._client
         self._client = None
         self._connected_address = None
-        self._reset_connection_ui()
+        self._disconnecting = True
+        self._reset_connection_ui(connect_enabled=False)
         # Keep Connect disabled until the old client is fully closed so a
         # new connect() does not race with the ongoing disconnect.
         self.btn_connect.setEnabled(False)
@@ -2394,9 +2446,16 @@ class BLEToolWindow(QMainWindow):
                 self.log_signal.emit("Disconnect timed out — forcing cleanup.")
             except Exception as e:
                 self.log_signal.emit(f"Disconnect error: {e}")
-            QTimer.singleShot(0, lambda: self.btn_connect.setEnabled(True))
+            await asyncio.sleep(BLE_RELEASE_DELAY_S)
+            QTimer.singleShot(0, self._mark_disconnect_ready)
 
         self._async.run(_disconnect())
+
+    def _mark_disconnect_ready(self):
+        """Allow a new connection after the OS BLE stack has had time to settle."""
+        self._disconnecting = False
+        if not self._client:
+            self.btn_connect.setEnabled(True)
 
     # ---- Pairing Agent (Linux only) --------------------------------------------
 
