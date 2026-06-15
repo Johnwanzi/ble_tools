@@ -968,6 +968,12 @@ class BLEToolWindow(QMainWindow):
         self.lbl_chunk_mtu = QLabel("(connect to auto-set)")
         self.lbl_chunk_mtu.setStyleSheet("color: #888; font-size: 11px;")
         fw_chunk_bar.addWidget(self.lbl_chunk_mtu)
+        fw_chunk_bar.addWidget(QLabel("Runs:"))
+        self.fw_stress_count_spin = QSpinBox()
+        self.fw_stress_count_spin.setRange(1, 10000)
+        self.fw_stress_count_spin.setValue(1)
+        self.fw_stress_count_spin.setToolTip("Upload count for stress test; 1 second between runs")
+        fw_chunk_bar.addWidget(self.fw_stress_count_spin)
         fw_chunk_bar.addStretch()
         self.btn_fw_send = QPushButton("Upload")
         self.btn_fw_send.setMinimumHeight(26)
@@ -2210,6 +2216,7 @@ class BLEToolWindow(QMainWindow):
         data       = self._fw_file_data
         total      = len(data)
         chunk_size = self.fw_chunk_spin.value()
+        run_count  = self.fw_stress_count_spin.value()
         notify_uuid = self._fio_find_notify_uuid(uuid)
         if not notify_uuid:
             self._log("File write: no notify characteristic found in the same "
@@ -2220,9 +2227,10 @@ class BLEToolWindow(QMainWindow):
 
         self.btn_fw_send.setEnabled(False)
         self.btn_fw_abort.setEnabled(True)
+        self.fw_stress_count_spin.setEnabled(False)
         self.fw_progress.setVisible(True)
         self.fw_progress.setValue(0)
-        self.fw_progress_signal.emit(0, f"0 / {total:,} B")
+        self.fw_progress_signal.emit(0, f"[1/{run_count}] 0 / {total:,} B")
 
         async def _upload():
             queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -2251,91 +2259,137 @@ class BLEToolWindow(QMainWindow):
                 long_write = (write_char is not None
                               and "write" in write_char.properties)
 
-                offset = 0
-                overwrite = True
-                t_start = time.perf_counter()
-                rtt_sum = 0.0
-                rtt_count = 0
-                while offset < total:
-                    if self._fw_abort:
-                        self.fw_progress_signal.emit(
-                            int(offset * 100 / total), "Aborted")
-                        return
+                async def _upload_once(run_index: int) -> tuple[float, float, float, int]:
+                    nonlocal long_write
 
-                    chunk = data[offset:offset + chunk_size]
-                    file_pb  = pb_encode_file(device_path, offset, total, chunk)
-                    write_pb = pb_encode_file_write(file_pb, overwrite, False)
-                    frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
+                    while not queue.empty():
+                        queue.get_nowait()
 
-                    # Send frame and wait for ACK
-                    t_req = time.perf_counter()
-                    try:
-                        rx = await self._fio_transact(
-                            write_char or uuid, frame, queue,
-                            timeout=3.0, frag_size=frag_size,
-                            long_write=long_write)
-                    except asyncio.TimeoutError:
-                        raise
-                    except Exception:
-                        if long_write:
-                            long_write = False
-                            self.log_signal.emit(
-                                "ATT Long Write unsupported, "
-                                "falling back to fragmentation")
+                    offset = 0
+                    overwrite = True
+                    t_start = time.perf_counter()
+                    rtt_sum = 0.0
+                    rtt_count = 0
+                    self.fw_progress_signal.emit(
+                        0, f"[{run_index}/{run_count}] 0 / {total:,} B")
+
+                    while offset < total:
+                        if self._fw_abort:
+                            self.fw_progress_signal.emit(
+                                int(offset * 100 / total),
+                                f"[{run_index}/{run_count}] Aborted")
+                            raise asyncio.CancelledError()
+
+                        chunk = data[offset:offset + chunk_size]
+                        file_pb  = pb_encode_file(device_path, offset, total, chunk)
+                        write_pb = pb_encode_file_write(file_pb, overwrite, False)
+                        frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
+
+                        # Send frame and wait for ACK
+                        t_req = time.perf_counter()
+                        try:
                             rx = await self._fio_transact(
                                 write_char or uuid, frame, queue,
                                 timeout=3.0, frag_size=frag_size,
-                                long_write=False)
-                        else:
+                                long_write=long_write)
+                        except asyncio.TimeoutError:
                             raise
-                    t_ack = time.perf_counter()
-                    rtt_sum += (t_ack - t_req)
-                    rtt_count += 1
+                        except Exception:
+                            if long_write:
+                                long_write = False
+                                self.log_signal.emit(
+                                    "ATT Long Write unsupported, "
+                                    "falling back to fragmentation")
+                                rx = await self._fio_transact(
+                                    write_char or uuid, frame, queue,
+                                    timeout=3.0, frag_size=frag_size,
+                                    long_write=False)
+                            else:
+                                raise
+                        t_ack = time.perf_counter()
+                        rtt_sum += (t_ack - t_req)
+                        rtt_count += 1
 
-                    parsed = self._fio_parse_response(rx)
-                    if parsed is None:
-                        raise RuntimeError("Bad proto frame in response")
-                    msg_type, pb = parsed
-                    if msg_type == _PB_MSG_TYPE_FAILURE:
-                        code, msg = pb_decode_failure(pb)
-                        raise RuntimeError(f"Device error code={code}: {msg}")
-                    if msg_type == _PB_MSG_TYPE_FILE:
-                        dec = pb_decode_file(pb)
-                        processed = dec.get("processed_byte")
-                        if processed is not None:
-                            offset = processed
+                        parsed = self._fio_parse_response(rx)
+                        if parsed is None:
+                            raise RuntimeError("Bad proto frame in response")
+                        msg_type, pb = parsed
+                        if msg_type == _PB_MSG_TYPE_FAILURE:
+                            code, msg = pb_decode_failure(pb)
+                            raise RuntimeError(f"Device error code={code}: {msg}")
+                        if msg_type == _PB_MSG_TYPE_FILE:
+                            dec = pb_decode_file(pb)
+                            processed = dec.get("processed_byte")
+                            if processed is not None:
+                                offset = processed
+                            else:
+                                offset += len(chunk)
                         else:
                             offset += len(chunk)
-                    else:
-                        offset += len(chunk)
 
-                    # Progress updates only after ACK confirms
-                    overwrite = False
-                    elapsed = t_ack - t_start
-                    speed = offset / elapsed if elapsed > 0 else 0
-                    avg_rtt = rtt_sum / rtt_count * 1000  # ms
-                    pct = min(int(offset * 100 / total), 100)
-                    self.fw_progress_signal.emit(
-                        pct,
-                        f"{offset:,}/{total:,} B  "
+                        # Progress updates only after ACK confirms
+                        overwrite = False
+                        elapsed = t_ack - t_start
+                        speed = offset / elapsed if elapsed > 0 else 0
+                        avg_rtt = rtt_sum / rtt_count * 1000  # ms
+                        pct = min(int(offset * 100 / total), 100)
+                        self.fw_progress_signal.emit(
+                            pct,
+                            f"[{run_index}/{run_count}] {offset:,}/{total:,} B  "
+                            f"{speed/1024:.1f} KB/s  "
+                            f"RTT {avg_rtt:.0f}ms")
+
+                    elapsed = time.perf_counter() - t_start
+                    speed = total / elapsed if elapsed > 0 else 0
+                    avg_rtt = rtt_sum / rtt_count * 1000 if rtt_count else 0
+                    self.fw_progress_signal.emit(100,
+                        f"[{run_index}/{run_count}] Done {total:,} B  "
                         f"{speed/1024:.1f} KB/s  "
-                        f"RTT {avg_rtt:.0f}ms")
+                        f"RTT {avg_rtt:.0f}ms  "
+                        f"{elapsed:.1f}s")
+                    self.log_signal.emit(
+                        f"File upload complete [{run_index}/{run_count}]: "
+                        f"{device_path}  {total:,} B  "
+                        f"avg {speed/1024:.1f} KB/s  "
+                        f"avg RTT {avg_rtt:.0f} ms  "
+                        f"total {elapsed:.1f} s  "
+                        f"({rtt_count} packets)")
+                    return speed, avg_rtt, elapsed, rtt_count
 
-                elapsed = time.perf_counter() - t_start
-                speed = total / elapsed if elapsed > 0 else 0
-                avg_rtt = rtt_sum / rtt_count * 1000 if rtt_count else 0
-                self.fw_progress_signal.emit(100,
-                    f"Done {total:,} B  "
-                    f"{speed/1024:.1f} KB/s  "
-                    f"RTT {avg_rtt:.0f}ms  "
-                    f"{elapsed:.1f}s")
                 self.log_signal.emit(
-                    f"File upload complete: {device_path}  {total:,} B  "
-                    f"avg {speed/1024:.1f} KB/s  "
-                    f"avg RTT {avg_rtt:.0f} ms  "
-                    f"total {elapsed:.1f} s  "
-                    f"({rtt_count} packets)")
+                    f"File upload stress start: {run_count} run(s), 1s interval")
+                success_count = 0
+                total_elapsed = 0.0
+                total_packets = 0
+                for run_index in range(1, run_count + 1):
+                    if self._fw_abort:
+                        self.fw_progress_signal.emit(0, "Aborted")
+                        break
 
+                    _, _, elapsed, packets = await _upload_once(run_index)
+                    success_count += 1
+                    total_elapsed += elapsed
+                    total_packets += packets
+
+                    if run_index < run_count:
+                        self.fw_progress_signal.emit(
+                            100, f"[{run_index}/{run_count}] Waiting 1s before next upload")
+                        for _ in range(10):
+                            if self._fw_abort:
+                                self.fw_progress_signal.emit(100, "Aborted")
+                                raise asyncio.CancelledError()
+                            await asyncio.sleep(0.1)
+
+                if success_count == run_count:
+                    self.log_signal.emit(
+                        f"File upload stress complete: {success_count}/{run_count} "
+                        f"run(s), {total_packets} packets, {total_elapsed:.1f}s upload time")
+                else:
+                    self.log_signal.emit(
+                        f"File upload stress stopped: {success_count}/{run_count} run(s) complete")
+
+            except asyncio.CancelledError:
+                self.log_signal.emit("File upload stress aborted.")
             except Exception as exc:
                 self.fw_progress_signal.emit(-1, f"Error: {exc}")
                 self.log_signal.emit(f"File upload error: {exc}")
@@ -2352,6 +2406,7 @@ class BLEToolWindow(QMainWindow):
         if pct == -2:
             self.btn_fw_send.setEnabled(True)
             self.btn_fw_abort.setEnabled(False)
+            self.fw_stress_count_spin.setEnabled(True)
             return
         if pct >= 0:
             self.fw_progress.setValue(pct)
