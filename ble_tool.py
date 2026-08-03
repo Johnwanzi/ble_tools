@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QHeaderView, QTextEdit, QLineEdit, QComboBox, QGroupBox,
     QMessageBox, QDialog, QDialogButtonBox, QMenu, QAction,
     QInputDialog, QSpinBox, QFileDialog, QProgressBar, QTabWidget,
-    QCheckBox,
+    QCheckBox, QSlider,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QFont
@@ -108,6 +108,7 @@ _PB_MSG_TYPE_PING            = 60206
 _PB_MSG_TYPE_SUCCESS         = 60207
 _PB_MSG_TYPE_FAILURE         = 60208
 _PB_MSG_TYPE_REBOOT          = 60400
+_PB_MSG_TYPE_DEVICE_SETTINGS_SET = 60412
 _PB_MSG_TYPE_FILE            = 60803
 _PB_MSG_TYPE_FILEWRITE       = 60805
 _PB_MSG_TYPE_GET_DEVICE_INFO            = 60600
@@ -118,6 +119,7 @@ _PB_MSG_TYPE_FIRMWARE_UPDATE_STATUS     = 61003
 _PB_MSG_NAMES = {
     60206: "Ping", 60207: "Success", 60208: "Failure",
     60400: "Reboot",
+    60412: "DeviceSettingsSet",
     60600: "GetDeviceInfo", 60601: "DeviceInfo",
     60803: "File", 60805: "FileWrite",
     61000: "FirmwareUpdate",
@@ -135,6 +137,10 @@ _DEVICE_TYPE_NAMES = {
 }
 _SE_TYPE_NAMES = {0x00: "THD89", 0x01: "SE608A"}
 _SE_STATE_NAMES = {0x00: "BOOT", 0x33: "APP_FACTORY", 0x55: "APP"}
+
+# DeviceSettings.brightness — backlight percent range (proto: 10-100)
+_BRIGHTNESS_MIN = 10
+_BRIGHTNESS_MAX = 100
 
 # Reboot.RebootType
 _REBOOT_TYPE_NORMAL      = 0
@@ -347,6 +353,24 @@ def pb_encode_file_write(file_bytes: bytes, overwrite: bool, append: bool) -> by
 def pb_encode_reboot(reboot_type: int) -> bytes:
     """Encode  Reboot { required RebootType reboot_type = 1; }"""
     return _encode_pb_uint32(1, reboot_type, required=True)
+
+
+def pb_encode_device_settings(*, brightness: int | None = None) -> bytes:
+    """Encode  DeviceSettings { ... optional uint32 brightness = 4; ... }.
+
+    Only fields explicitly provided are emitted; an absent field means
+    "leave unchanged" on the device.  Currently only brightness (field 4,
+    backlight percent 10-100) is supported — extend as more controls land.
+    """
+    out = b""
+    if brightness is not None:
+        out += _encode_pb_uint32(4, brightness, required=True)
+    return out
+
+
+def pb_encode_device_settings_set(settings_pb: bytes) -> bytes:
+    """Encode  DeviceSettingsSet { required DeviceSettings settings = 1; }"""
+    return _encode_pb_message(1, settings_pb)
 
 
 def pb_encode_firmware_target(target_id: int, path: str) -> bytes:
@@ -726,6 +750,7 @@ class BLEToolWindow(QMainWindow):
     fw_update_result_signal = pyqtSignal(bool, str)     # success, result_text
     fw_status_result_signal = pyqtSignal(bool, str)     # success, result_text
     device_info_result_signal = pyqtSignal(bool, str)   # success, result_text
+    device_settings_result_signal = pyqtSignal(bool, str)  # success, result_text
 
     def __init__(self):
         super().__init__()
@@ -1138,6 +1163,36 @@ class BLEToolWindow(QMainWindow):
 
         self.proto_tabs.addTab(reboot_tab, "Reboot")
 
+        # -- Settings tab (DeviceSettingsSet) --
+        settings_tab = QWidget()
+        settings_lay = QVBoxLayout(settings_tab)
+        settings_lay.setContentsMargins(4, 8, 4, 4)
+        settings_lay.setSpacing(4)
+
+        bright_bar = QHBoxLayout()
+        bright_bar.addWidget(QLabel("Brightness:"))
+        self.settings_bright_slider = QSlider(Qt.Horizontal)
+        self.settings_bright_slider.setRange(_BRIGHTNESS_MIN, _BRIGHTNESS_MAX)
+        self.settings_bright_slider.setValue(_BRIGHTNESS_MAX)
+        bright_bar.addWidget(self.settings_bright_slider, 1)
+        self.settings_bright_spin = QSpinBox()
+        self.settings_bright_spin.setRange(_BRIGHTNESS_MIN, _BRIGHTNESS_MAX)
+        self.settings_bright_spin.setValue(_BRIGHTNESS_MAX)
+        self.settings_bright_spin.setSuffix(" %")
+        bright_bar.addWidget(self.settings_bright_spin)
+        self.btn_settings_bright = QPushButton("Set Brightness")
+        self.btn_settings_bright.setMinimumHeight(28)
+        self.btn_settings_bright.setEnabled(False)
+        bright_bar.addWidget(self.btn_settings_bright)
+        settings_lay.addLayout(bright_bar)
+
+        self.lbl_settings_result = QLabel("")
+        self.lbl_settings_result.setWordWrap(True)
+        settings_lay.addWidget(self.lbl_settings_result)
+        settings_lay.addStretch()
+
+        self.proto_tabs.addTab(settings_tab, "Settings")
+
         proto_layout.addWidget(self.proto_tabs)
         right_layout.addWidget(proto_group)
 
@@ -1194,6 +1249,10 @@ class BLEToolWindow(QMainWindow):
         self.fw_status_result_signal.connect(self._on_fw_status_result)
         self.btn_di_query.clicked.connect(self._on_device_info)
         self.device_info_result_signal.connect(self._on_device_info_result)
+        self.settings_bright_slider.valueChanged.connect(self.settings_bright_spin.setValue)
+        self.settings_bright_spin.valueChanged.connect(self.settings_bright_slider.setValue)
+        self.btn_settings_bright.clicked.connect(self._on_settings_set_brightness)
+        self.device_settings_result_signal.connect(self._on_device_settings_result)
 
     # ---- Logging ----------------------------------------------------------
 
@@ -1464,6 +1523,7 @@ class BLEToolWindow(QMainWindow):
             self.btn_fwu_send.setEnabled(True)
             self.btn_fws_query.setEnabled(True)
             self.btn_di_query.setEnabled(True)
+            self.btn_settings_bright.setEnabled(True)
             if HAS_DBUS:
                 self.btn_pair.setEnabled(True)
         else:
@@ -2112,6 +2172,28 @@ class BLEToolWindow(QMainWindow):
             f"font-family: monospace; font-size: 11px; }}")
         self.btn_di_query.setEnabled(self._client is not None)
 
+    # ---- Device Settings (DeviceSettingsSet) ------------------------------
+
+    def _on_settings_set_brightness(self):
+        brightness = self.settings_bright_spin.value()
+        settings_pb = pb_encode_device_settings(brightness=brightness)
+        pb_payload = pb_encode_device_settings_set(settings_pb)
+
+        self.lbl_settings_result.setText(f"Setting brightness to {brightness}%…")
+        self.btn_settings_bright.setEnabled(False)
+        ok = self._send_pb_command(
+            _PB_MSG_TYPE_DEVICE_SETTINGS_SET, pb_payload,
+            self.device_settings_result_signal, timeout=5.0,
+            label=f"DeviceSettingsSet[brightness={brightness}]")
+        if not ok:
+            self.btn_settings_bright.setEnabled(True)
+            self.lbl_settings_result.setText("")
+
+    def _on_device_settings_result(self, success: bool, text: str):
+        color = "#2ecc71" if success else "#e74c3c"
+        self.lbl_settings_result.setText(f'<span style="color:{color}">{text}</span>')
+        self.btn_settings_bright.setEnabled(self._client is not None)
+
     # ---- File I/O (Proto V0) ------------------------------------------------
 
     def _fio_uuid(self) -> str | None:
@@ -2457,6 +2539,8 @@ class BLEToolWindow(QMainWindow):
         self.btn_fwu_send.setEnabled(False)
         self.btn_fws_query.setEnabled(False)
         self.btn_di_query.setEnabled(False)
+        self.btn_settings_bright.setEnabled(False)
+        self.lbl_settings_result.setText("")
         self.lbl_reboot_result.setText("")
         self.lbl_fwu_result.setText("")
         self.fws_result_text.clear()
