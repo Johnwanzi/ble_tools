@@ -5,6 +5,11 @@ __pycache__/
 venv/
 *.egg-info/
 dist/
+# Keep the restored Android 1.1.0 deliverables in version control.
+!/dist/
+/dist/*
+!/dist/ble-tool-1.1.0-debug.apk
+!/dist/ble-tool-1.1.0-debug.apk.sha256
 build/
 .idea/
 .vscode/
@@ -12,3 +17,8 @@ build/
 *.bin
 *.txt
 *.proto
+.android-tools/
+.gradle/
+local.properties
+*.jks
+*.keystore

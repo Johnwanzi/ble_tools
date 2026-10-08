@@ -1,5 +1,11 @@
 # BLE Tool
 
+## Android APK
+
+An Android version is available in [`android/`](android/README.md), focused on Ping and file upload, with BLE scanning and connection setup. Requires Android 8.0+ and a BLE-capable phone.
+
+On Windows, run `./build-apk.ps1` to build and verify `dist/ble-tool-1.1.0-debug.apk`. See the [Android guide](android/README.md) for toolchain setup, installation, permissions, and testing.
+
 A desktop BLE (Bluetooth Low Energy) scanner and debugger inspired by nRF Connect, built with Python, PyQt5 and bleak.
 
 ## Features
