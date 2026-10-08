@@ -26,6 +26,9 @@ from bleak.backends.scanner import AdvertisementData
 # Check if we're on Linux for dbus support
 IS_LINUX = platform.system() == 'Linux'
 BLE_RELEASE_DELAY_S = 1.0
+BLE_CLEANUP_TIMEOUT_S = 5.0
+_FW_CHUNK_DEFAULT = 1800
+_FW_CHUNK_MAX = 2048
 
 if IS_LINUX:
     try:
@@ -49,6 +52,7 @@ class AsyncBridge(QObject):
     def __init__(self):
         super().__init__()
         self._loop = asyncio.new_event_loop()
+        self._tasks: dict[asyncio.Task, bool] = {}
         import threading
         def _run():
             asyncio.set_event_loop(self._loop)
@@ -56,11 +60,33 @@ class AsyncBridge(QObject):
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
 
-    def run(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+    def run(self, coro, *, cancel_on_shutdown: bool = True):
+        async def _tracked():
+            task = asyncio.current_task()
+            self._tasks[task] = cancel_on_shutdown
+            try:
+                return await coro
+            finally:
+                self._tasks.pop(task, None)
+
+        return asyncio.run_coroutine_threadsafe(_tracked(), self._loop)
+
+    async def drain(self):
+        """Cancel BLE operations, but let connection cleanup finish normally."""
+        pending = [task for task in self._tasks if task is not asyncio.current_task()]
+        for task in pending:
+            if self._tasks[task]:
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def stop(self):
+        if self._loop.is_closed():
+            return
         self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=2.0)
+        if not self._thread.is_alive():
+            self._loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +766,7 @@ class BLEToolWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     connection_done = pyqtSignal(bool, str)  # success, message
     disconnected_signal = pyqtSignal(str)   # reason string (unexpected disconnect)
+    shutdown_done = pyqtSignal()
     services_discovered = pyqtSignal(object)  # list of BleakGATTService
     char_value_read = pyqtSignal(str, object)  # uuid, bytes value
     char_notify_received = pyqtSignal(str, object)  # uuid, bytes value
@@ -764,6 +791,8 @@ class BLEToolWindow(QMainWindow):
         self._client: BleakClient | None = None
         self._connected_address: str | None = None
         self._disconnecting = False
+        self._closing = False
+        self._close_ready = False
         self._notifying: set[str] = set()  # UUIDs currently subscribed
         self._service_baseline: dict[str, tuple[int, int]] = {}  # address -> (services, chars)
         self._pairing_result: bool | None = None
@@ -775,6 +804,7 @@ class BLEToolWindow(QMainWindow):
         self._connect_signals()
         self._setup_pairing_agent()
         self.disconnected_signal.connect(self._on_unexpected_disconnect)
+        self.shutdown_done.connect(self._finish_close)
 
     # ---- UI setup ---------------------------------------------------------
 
@@ -984,11 +1014,11 @@ class BLEToolWindow(QMainWindow):
         fw_chunk_bar = QHBoxLayout()
         fw_chunk_bar.addWidget(QLabel("Chunk:"))
         self.fw_chunk_spin = QSpinBox()
-        self.fw_chunk_spin.setRange(16, 1800)
+        self.fw_chunk_spin.setRange(16, _FW_CHUNK_MAX)
         self.fw_chunk_spin.setSingleStep(64)
-        self.fw_chunk_spin.setValue(1800)
+        self.fw_chunk_spin.setValue(_FW_CHUNK_DEFAULT)
         self.fw_chunk_spin.setSuffix(" B")
-        self.fw_chunk_spin.setToolTip("Auto-set to MTU-derived max after connection")
+        self.fw_chunk_spin.setToolTip(f"Auto-set to {_FW_CHUNK_DEFAULT} B after connection; max {_FW_CHUNK_MAX} B")
         fw_chunk_bar.addWidget(self.fw_chunk_spin)
         self.lbl_chunk_mtu = QLabel("(connect to auto-set)")
         self.lbl_chunk_mtu.setStyleSheet("color: #888; font-size: 11px;")
@@ -1272,6 +1302,8 @@ class BLEToolWindow(QMainWindow):
             self._start_scan()
 
     def _start_scan(self):
+        if self._closing:
+            return
         self._scanning = True
         self.btn_scan.setText("Stop Scan")
         self._log("Scanning started...")
@@ -1289,7 +1321,7 @@ class BLEToolWindow(QMainWindow):
                 # Use QTimer to update UI safely from async context
                 QTimer.singleShot(0, lambda: self.btn_scan.setText("Start Scan"))
 
-        self._async.run(_scan())
+        self._async.run(_scan(), cancel_on_shutdown=False)
 
     def _stop_scan(self):
         self._scanning = False
@@ -1304,7 +1336,7 @@ class BLEToolWindow(QMainWindow):
                     self.log_signal.emit(f"Stop scan error: {e}")
                 self._scanner = None
 
-        self._async.run(_stop())
+        self._async.run(_stop(), cancel_on_shutdown=False)
 
     def _on_device_found(self, device: BLEDevice, adv: AdvertisementData):
         item = DeviceItem(device, adv)
@@ -1353,6 +1385,8 @@ class BLEToolWindow(QMainWindow):
     # ---- Connection & Service Discovery ------------------------------------
 
     def _on_connect(self):
+        if self._closing:
+            return
         if self._disconnecting:
             self._log("Previous disconnect is still settling; retry in a moment.")
             return
@@ -1425,8 +1459,10 @@ class BLEToolWindow(QMainWindow):
                 services = None
                 counts = (0, 0)
                 for attempt in range(2):
+                    if self._closing:
+                        return
                     self._client, services, counts = await _connect_once()
-                    if not baseline or counts[0] >= baseline[0] and counts[1] >= baseline[1]:
+                    if self._closing or not baseline or counts[0] >= baseline[0] and counts[1] >= baseline[1]:
                         break
 
                     self.log_signal.emit(
@@ -1451,6 +1487,8 @@ class BLEToolWindow(QMainWindow):
                     max(old_baseline[1], counts[1]),
                 )
                 self._connected_address = address
+                if self._closing:
+                    return
 
                 # ---- Connection tuning (WinRT) ----
                 backend = getattr(self._client, '_backend', None)
@@ -1488,7 +1526,7 @@ class BLEToolWindow(QMainWindow):
                 self._connected_address = None
                 self.connection_done.emit(False, f"Connection failed: {e}")
 
-        self._async.run(_connect())
+        self._async.run(_connect(), cancel_on_shutdown=False)
 
     @staticmethod
     def _service_counts(services) -> tuple[int, int]:
@@ -1506,10 +1544,10 @@ class BLEToolWindow(QMainWindow):
         mtu = self._negotiated_mtu
         if mtu <= 0:
             return
-        self.fw_chunk_spin.setRange(16, 1800)
+        self.fw_chunk_spin.setRange(16, _FW_CHUNK_MAX)
         self.fw_chunk_spin.setSingleStep(64)
-        self.fw_chunk_spin.setValue(1800)
-        self.lbl_chunk_mtu.setText(f"(MTU {mtu}, chunk max 1800 B)")
+        self.fw_chunk_spin.setValue(_FW_CHUNK_DEFAULT)
+        self.lbl_chunk_mtu.setText(f"(MTU {mtu}, chunk max {_FW_CHUNK_MAX} B)")
 
     def _on_connection_done(self, success: bool, msg: str):
         self._log(msg)
@@ -2557,6 +2595,8 @@ class BLEToolWindow(QMainWindow):
 
     def _on_unexpected_disconnect(self, reason: str):
         """Handle device-initiated disconnect (via disconnected_callback)."""
+        if self._closing:
+            return
         self._log(f"[!] {reason}")
         self._client = None
         self._connected_address = None
@@ -2565,7 +2605,7 @@ class BLEToolWindow(QMainWindow):
         QTimer.singleShot(int(BLE_RELEASE_DELAY_S * 1000), self._mark_disconnect_ready)
 
     def _on_disconnect(self):
-        if not self._client:
+        if self._closing or not self._client:
             return
         self._log("Disconnecting...")
         client = self._client
@@ -2588,7 +2628,7 @@ class BLEToolWindow(QMainWindow):
             await asyncio.sleep(BLE_RELEASE_DELAY_S)
             QTimer.singleShot(0, self._mark_disconnect_ready)
 
-        self._async.run(_disconnect())
+        self._async.run(_disconnect(), cancel_on_shutdown=False)
 
     def _mark_disconnect_ready(self):
         """Allow a new connection after the OS BLE stack has had time to settle."""
@@ -2671,13 +2711,50 @@ class BLEToolWindow(QMainWindow):
 
     # ---- Cleanup ----------------------------------------------------------
 
-    def closeEvent(self, event):
-        if self._scanning:
-            self._stop_scan()
-        if self._client:
-            self._async.run(self._client.disconnect())
+    async def _shutdown_ble(self):
+        try:
+            # Finish in-flight connect/disconnect/scan operations before releasing
+            # their resources. Cancel transfers and allow their finally blocks to run.
+            await self._async.drain()
+            if self._scanner:
+                try:
+                    await asyncio.wait_for(self._scanner.stop(), BLE_CLEANUP_TIMEOUT_S)
+                except Exception as exc:
+                    self.log_signal.emit(f"Stop scan during shutdown failed: {exc!r}")
+                finally:
+                    self._scanner = None
+                    self._scanning = False
+
+            client = self._client
+            self._client = None  # Suppress the expected disconnect callback.
+            if client:
+                try:
+                    await asyncio.wait_for(client.disconnect(), BLE_CLEANUP_TIMEOUT_S)
+                    self.log_signal.emit("Disconnected.")
+                except Exception as exc:
+                    self.log_signal.emit(f"Disconnect during shutdown failed: {exc!r}")
+            self._connected_address = None
+            self._notifying.clear()
+        finally:
+            self.shutdown_done.emit()
+
+    def _finish_close(self):
         self._async.stop()
-        event.accept()
+        self._close_ready = True
+        self.close()
+
+    def closeEvent(self, event):
+        if self._close_ready:
+            event.accept()
+            return
+        event.ignore()
+        if self._closing:
+            return
+        self._closing = True
+        self._fw_abort = True
+        self.centralWidget().setEnabled(False)
+        self._log("Closing: stopping BLE activity and disconnecting...")
+        self._async.run(self._shutdown_ble())
 
 
 # ---------------------------------------------------------------------------
