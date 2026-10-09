@@ -6,6 +6,8 @@ import asyncio
 import signal
 import platform
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -29,6 +31,9 @@ BLE_RELEASE_DELAY_S = 1.0
 BLE_CLEANUP_TIMEOUT_S = 5.0
 _FW_CHUNK_DEFAULT = 1800
 _FW_CHUNK_MAX = 2048
+_FW_SEND_WINDOW_DEFAULT = 2
+_FW_SEND_WINDOW_MAX = 5
+_FW_ACK_TIMEOUT_S = 3.0
 
 if IS_LINUX:
     try:
@@ -329,6 +334,14 @@ def parse_pb_response(payload: bytes) -> tuple[int, bytes] | None:
 # ---------------------------------------------------------------------------
 # File protocol helpers
 # ---------------------------------------------------------------------------
+
+@dataclass
+class _PendingFileWrite:
+    offset: int
+    end: int
+    started_at: float
+    deadline: float
+
 
 def _encode_pb_uint32(field_num: int, value: int, required: bool = False) -> bytes:
     if value == 0 and not required:
@@ -1023,6 +1036,13 @@ class BLEToolWindow(QMainWindow):
         self.lbl_chunk_mtu = QLabel("(connect to auto-set)")
         self.lbl_chunk_mtu.setStyleSheet("color: #888; font-size: 11px;")
         fw_chunk_bar.addWidget(self.lbl_chunk_mtu)
+        fw_chunk_bar.addWidget(QLabel("Window (N):"))
+        self.fw_window_spin = QSpinBox()
+        self.fw_window_spin.setRange(1, _FW_SEND_WINDOW_MAX)
+        self.fw_window_spin.setValue(_FW_SEND_WINDOW_DEFAULT)
+        self.fw_window_spin.setToolTip(
+            "Maximum unacknowledged file blocks (1-5); 1 waits for each ACK")
+        fw_chunk_bar.addWidget(self.fw_window_spin)
         fw_chunk_bar.addWidget(QLabel("Runs:"))
         self.fw_stress_count_spin = QSpinBox()
         self.fw_stress_count_spin.setRange(1, 10000)
@@ -2265,17 +2285,14 @@ class BLEToolWindow(QMainWindow):
                 return notify_uuid
         return None
 
-    async def _fio_transact(self, char, frame: bytes,
-                            queue: asyncio.Queue, timeout: float = 3.0,
-                            *, frag_size: int = 244,
-                            long_write: bool = False) -> bytes:
-        """Send *frame* via BLE write, then wait for one notify ACK.
+    async def _fio_send_frame(self, char, frame: bytes,
+                              *, frag_size: int = 244,
+                              long_write: bool = False):
+        """Send a complete frame in order, without waiting for its notify ACK.
 
-        When *long_write* is True the entire frame is sent in a single
-        write_gatt_char(response=True) call.  WinRT handles ATT Long
-        Write (Prepare Write + Execute Write) in one async operation,
-        eliminating per-fragment Python-level await overhead (~13 ms each
-        on a typical BLE connection interval).
+        Try a single write-with-response when *long_write* is True;
+        otherwise send consecutive fragments with write-without-response.
+        The upload loop serializes calls so fragments cannot interleave.
         """
         if long_write:
             await self._client.write_gatt_char(char, frame, response=True)
@@ -2285,7 +2302,6 @@ class BLEToolWindow(QMainWindow):
             for i in range(0, len(frame), frag_size):
                 await self._client.write_gatt_char(
                     char, frame[i:i + frag_size], response=False)
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
 
     def _fio_parse_response(self, rx: bytes) -> tuple[int, bytes] | None:
         payload = parse_proto_frame(rx)
@@ -2336,6 +2352,7 @@ class BLEToolWindow(QMainWindow):
         data       = self._fw_file_data
         total      = len(data)
         chunk_size = self.fw_chunk_spin.value()
+        window_size = self.fw_window_spin.value()
         run_count  = self.fw_stress_count_spin.value()
         notify_uuid = self._fio_find_notify_uuid(uuid)
         if not notify_uuid:
@@ -2348,15 +2365,18 @@ class BLEToolWindow(QMainWindow):
         self.btn_fw_send.setEnabled(False)
         self.btn_fw_abort.setEnabled(True)
         self.fw_stress_count_spin.setEnabled(False)
+        self.fw_window_spin.setEnabled(False)
         self.fw_progress.setVisible(True)
         self.fw_progress.setValue(0)
         self.fw_progress_signal.emit(0, f"[1/{run_count}] 0 / {total:,} B")
 
         async def _upload():
-            queue: asyncio.Queue[bytes] = asyncio.Queue()
+            queue: asyncio.Queue[tuple[bytes, float]] = asyncio.Queue()
 
             def _notify_cb(handle, raw: bytearray):
-                loop.call_soon_threadsafe(queue.put_nowait, bytes(raw))
+                # Preserve arrival time even when another block is still sending.
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, (bytes(raw), time.perf_counter()))
 
             try:
                 await self._client.start_notify(notify_uuid, _notify_cb)
@@ -2385,50 +2405,72 @@ class BLEToolWindow(QMainWindow):
                     while not queue.empty():
                         queue.get_nowait()
 
-                    offset = 0
-                    overwrite = True
+                    next_offset = 0
+                    acked_offset = 0
+                    pending: deque[_PendingFileWrite] = deque()
                     t_start = time.perf_counter()
                     rtt_sum = 0.0
                     rtt_count = 0
                     self.fw_progress_signal.emit(
                         0, f"[{run_index}/{run_count}] 0 / {total:,} B")
 
-                    while offset < total:
+                    while next_offset < total or pending:
                         if self._fw_abort:
                             self.fw_progress_signal.emit(
-                                int(offset * 100 / total),
+                                int(acked_offset * 100 / total),
                                 f"[{run_index}/{run_count}] Aborted")
                             raise asyncio.CancelledError()
 
-                        chunk = data[offset:offset + chunk_size]
-                        file_pb  = pb_encode_file(device_path, offset, total, chunk)
-                        write_pb = pb_encode_file_write(file_pb, overwrite, False)
-                        frame    = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
+                        # Consume available ACKs promptly; otherwise fill every
+                        # free slot without waiting for earlier blocks' ACKs.
+                        if (next_offset < total
+                                and len(pending) < window_size
+                                and (not pending or queue.empty())):
+                            chunk = data[next_offset:next_offset + chunk_size]
+                            file_pb = pb_encode_file(device_path, next_offset, total, chunk)
+                            write_pb = pb_encode_file_write(file_pb, next_offset == 0, False)
+                            frame = build_pb_frame(_PB_MSG_TYPE_FILEWRITE, write_pb, router=1)
 
-                        # Send frame and wait for ACK
-                        t_req = time.perf_counter()
-                        try:
-                            rx = await self._fio_transact(
-                                write_char or uuid, frame, queue,
-                                timeout=3.0, frag_size=frag_size,
-                                long_write=long_write)
-                        except asyncio.TimeoutError:
-                            raise
-                        except Exception:
-                            if long_write:
+                            t_req = time.perf_counter()
+                            try:
+                                await self._fio_send_frame(
+                                    write_char or uuid, frame,
+                                    frag_size=frag_size, long_write=long_write)
+                            except asyncio.TimeoutError:
+                                raise
+                            except Exception:
+                                if not long_write:
+                                    raise
                                 long_write = False
                                 self.log_signal.emit(
                                     "ATT Long Write unsupported, "
                                     "falling back to fragmentation")
-                                rx = await self._fio_transact(
-                                    write_char or uuid, frame, queue,
-                                    timeout=3.0, frag_size=frag_size,
-                                    long_write=False)
+                                await self._fio_send_frame(
+                                    write_char or uuid, frame,
+                                    frag_size=frag_size, long_write=False)
+
+                            end = next_offset + len(chunk)
+                            pending.append(_PendingFileWrite(
+                                next_offset, end, t_req,
+                                time.perf_counter() + _FW_ACK_TIMEOUT_S))
+                            next_offset = end
+                            continue
+
+                        # Deadlines belong to individual blocks, so sending a
+                        # later block or receiving unrelated data cannot reset them.
+                        oldest = pending[0]
+                        try:
+                            if queue.empty():
+                                rx, t_ack = await asyncio.wait_for(
+                                    queue.get(), timeout=max(
+                                        0.0, oldest.deadline - time.perf_counter()))
                             else:
-                                raise
-                        t_ack = time.perf_counter()
-                        rtt_sum += (t_ack - t_req)
-                        rtt_count += 1
+                                rx, t_ack = queue.get_nowait()
+                            if t_ack > oldest.deadline:
+                                raise asyncio.TimeoutError()
+                        except asyncio.TimeoutError:
+                            raise TimeoutError(
+                                f"File ACK timeout at offset {oldest.offset}") from None
 
                         parsed = self._fio_parse_response(rx)
                         if parsed is None:
@@ -2441,21 +2483,38 @@ class BLEToolWindow(QMainWindow):
                             dec = pb_decode_file(pb)
                             processed = dec.get("processed_byte")
                             if processed is not None:
-                                offset = processed
+                                # processed_byte is a cumulative byte count.
+                                # Stale/duplicate ACKs must not free another slot.
+                                if processed <= acked_offset:
+                                    continue
+                                if not any(block.end == processed for block in pending):
+                                    raise RuntimeError(
+                                        f"Invalid acknowledged offset {processed}: "
+                                        f"pending blocks {oldest.offset}..{next_offset}")
+                                ack_end = processed
                             else:
-                                offset += len(chunk)
+                                ack_end = oldest.end
+                        elif msg_type == _PB_MSG_TYPE_SUCCESS:
+                            # ACKs without a byte count correspond to sent blocks
+                            # in FIFO order; no request-sequence echo is assumed.
+                            ack_end = oldest.end
                         else:
-                            offset += len(chunk)
+                            continue
 
-                        # Progress updates only after ACK confirms
-                        overwrite = False
+                        while pending and pending[0].end <= ack_end:
+                            block = pending.popleft()
+                            rtt_sum += t_ack - block.started_at
+                            rtt_count += 1
+                        acked_offset = ack_end
+
+                        # Progress reflects confirmed bytes, not queued bytes.
                         elapsed = t_ack - t_start
-                        speed = offset / elapsed if elapsed > 0 else 0
+                        speed = acked_offset / elapsed if elapsed > 0 else 0
                         avg_rtt = rtt_sum / rtt_count * 1000  # ms
-                        pct = min(int(offset * 100 / total), 100)
+                        pct = min(int(acked_offset * 100 / total), 100)
                         self.fw_progress_signal.emit(
                             pct,
-                            f"[{run_index}/{run_count}] {offset:,}/{total:,} B  "
+                            f"[{run_index}/{run_count}] {acked_offset:,}/{total:,} B  "
                             f"{speed/1024:.1f} KB/s  "
                             f"RTT {avg_rtt:.0f}ms")
 
@@ -2477,7 +2536,8 @@ class BLEToolWindow(QMainWindow):
                     return speed, avg_rtt, elapsed, rtt_count
 
                 self.log_signal.emit(
-                    f"File upload stress start: {run_count} run(s), 1s interval")
+                    f"File upload stress start: {run_count} run(s), 1s interval, "
+                    f"send window {window_size} blocks")
                 success_count = 0
                 total_elapsed = 0.0
                 total_packets = 0
@@ -2527,6 +2587,7 @@ class BLEToolWindow(QMainWindow):
             self.btn_fw_send.setEnabled(True)
             self.btn_fw_abort.setEnabled(False)
             self.fw_stress_count_spin.setEnabled(True)
+            self.fw_window_spin.setEnabled(True)
             return
         if pct >= 0:
             self.fw_progress.setValue(pct)

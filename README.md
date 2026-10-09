@@ -51,6 +51,12 @@ python ble_tool.py
 6. Enter hex bytes in the **Data** field (e.g. `01 02 FF`) and click **Write**.
 7. Click **Disconnect** when done.
 
+### File upload
+
+The desktop **File Write** tab sends file blocks in order with up to **N unacknowledged blocks** in flight. Set **Window (N)** to **1-5** (default **2**) before uploading; the setting is locked during an upload and applies to all its runs. Each ACK frees space for the next block; BLE fragments from different blocks never interleave. Chunk size defaults to 1800 bytes and is independent of this window size.
+
+Progress counts acknowledged bytes, and completion waits for all blocks to be confirmed. A `File.processed_byte` response is treated as a cumulative byte count at a sent block boundary; duplicate counts are ignored. `Success` or `File` responses without a byte count acknowledge one block in send order. Partial-block or unsent offsets stop the upload with an error. Each block has a 3-second ACK deadline after its BLE write completes; failures and timeouts stop the upload without automatic retries.
+
 ## Dependencies
 
 | Package | Purpose |
