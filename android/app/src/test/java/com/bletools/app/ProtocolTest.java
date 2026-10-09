@@ -50,12 +50,6 @@ public final class ProtocolTest {
             for(int i=0;i<largeFrame.length;i+=size)messages.addAll(decoder.feed(Arrays.copyOfRange(largeFrame,i,Math.min(i+size,largeFrame.length))));
             check(messages.size()==1 && messages.get(0).type==Protocol.FILE_WRITE,"MTU fragmentation "+size);
         }
-        check(Protocol.acknowledgedOffset(message(Protocol.FILE,Protocol.uint(6,1800)),0,1800,5000)==1800,"processed_byte is field 6");
-        check(Protocol.acknowledgedOffset(message(Protocol.FILE,Protocol.uint(6,1900)),1800,1800,5000)==1900,"Partial ACK");
-        check(Protocol.acknowledgedOffset(message(Protocol.SUCCESS,new byte[0]),1800,1800,5000)==3600,"Success ACK");
-        check(Protocol.acknowledgedOffset(message(Protocol.FILE,new byte[0]),0,100,100)==100,"Legacy ACK without processed_byte");
-        for(long bad:new long[]{0,99,301,9999})rejects(()->Protocol.acknowledgedOffset(message(Protocol.FILE,Protocol.uint(6,bad)),100,200,1000),"Reject stalled/backward/oversized ACK "+bad);
-        rejects(()->Protocol.acknowledgedOffset(message(60601,new byte[0]),0,100,100),"Reject wrong ACK type");
         rejects(()->Protocol.fields(new byte[]{8,(byte)128}),"Truncated varint");
         rejects(()->Protocol.fields(new byte[]{10,10,1}),"Truncated bytes");
         rejects(()->Protocol.fields(new byte[]{0}),"Invalid tag");
@@ -67,6 +61,7 @@ public final class ProtocolTest {
         byte[] unknown=Protocol.concat(Protocol.uint(99,123),Protocol.string(1,"hello"));
         check(Protocol.text(unknown,1).equals("hello"),"Unknown protobuf fields skipped");
         check(Protocol.describe(message(Protocol.FAILURE,Protocol.concat(Protocol.uint(1,7),Protocol.string(2,"denied"),Protocol.uint(3,9)))).contains("subcode=9"),"Failure detail");
-        System.out.println("PASS: "+checks+" checks; "+fixtures+" desktop wire vectors, fragmentation, CRC, parsing and upload ACK validation.");
+        checks += FileUploaderTest.run();
+        System.out.println("PASS: "+checks+" checks; "+fixtures+" desktop wire vectors, fragmentation, CRC, parsing and windowed uploads (N=1..5).");
     }
 }

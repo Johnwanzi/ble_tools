@@ -118,12 +118,6 @@ public final class Protocol {
         byte[] file=concat(string(1,path),uint(2,offset),uint(3,total),chunk.length==0 ? new byte[0] : bytes(4,chunk));
         return concat(bytes(1,file),uint(2,overwrite?1:0),uint(3,0));
     }
-    public static long acknowledgedOffset(Message message,long offset,int sent,long total) {
-        if(message.type!=FILE && message.type!=SUCCESS) throw new IllegalArgumentException("Unexpected upload response: "+message.type);
-        long next=message.type==FILE ? number(message.body,6,offset+sent) : offset+sent;
-        if(next<=offset || next>offset+sent || next>total) throw new IllegalArgumentException("Invalid acknowledged offset: "+next);
-        return next;
-    }
     public static String hex(byte[] data) {
         StringBuilder s=new StringBuilder(data.length*3);
         for(byte b:data) {if(s.length()>0)s.append(' '); s.append(String.format(Locale.ROOT,"%02X",b&255));}

@@ -39,7 +39,7 @@ public final class MainActivity extends Activity implements BleClient.Listener {
     private Runnable pendingPermissionAction;
     private TextView connection,scanStatus,connectionDetail,resultView,fileLabel,progressLabel;
     private EditText filter,rssi,pingInput,pathInput,chunkInput,runsInput;
-    private Spinner txSpinner,rxSpinner;
+    private Spinner txSpinner,rxSpinner,windowSpinner;
     private Button scanButton;
     private ProgressBar progress;
     private LinearLayout deviceList,channelPanel;
@@ -56,7 +56,7 @@ public final class MainActivity extends Activity implements BleClient.Listener {
         adapter=manager==null?null:manager.getAdapter();
         ble=new BleClient(this,this);
         buildUi();
-        log("BLE Tool 1.1.0 · 连接设备后，可使用 Ping 和文件传输。");
+        log("BLE Tool 1.3.0 · 连接设备后，可使用 Ping 和文件传输。");
         if(adapter==null) log("此设备不支持蓝牙。");
     }
     private int dp(int n) {return Math.round(n*getResources().getDisplayMetrics().density);}
@@ -139,6 +139,9 @@ public final class MainActivity extends Activity implements BleClient.Listener {
         });
         pathInput=input(body,"设备保存路径","vol0:test.bin",false);
         chunkInput=input(body,"每个协议包的数据字节数 (16–2048)","1800",true);
+        windowSpinner=spinner(body,"发送窗口 N（最多未确认块数）","1","2","3","4","5");
+        windowSpinner.setContentDescription("发送窗口 N");
+        windowSpinner.setSelection(FileUploader.DEFAULT_WINDOW-1);
         runsInput=input(body,"重复上传次数 (1–10000)","1",true);
         LinearLayout upload=row(body);button(upload,"开始上传",this::startUpload);button(upload,"取消并断开",this::disconnect);
         progress=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);progress.setMax(100);body.addView(progress);
@@ -271,19 +274,22 @@ public final class MainActivity extends Activity implements BleClient.Listener {
     private void startUpload() {
         if(uploadFile==null || !uploadFile.isFile())throw new IllegalStateException("请先选择上传文件");
         File file=uploadFile;String path=required(pathInput);int chunk=integer(chunkInput,16,2048),runs=integer(runsInput,1,10000);
+        int window=windowSpinner.getSelectedItemPosition()+1;
         protocolJob("文件上传",(tx,rx)->{
             long total=file.length();if(total==0)throw new IOException("不支持上传空文件");
+            log("开始上传：发送窗口 "+window+" 块，分块 "+chunk+" B，重复 "+runs+" 次");
             try(RandomAccessFile input=new RandomAccessFile(file,"r")) {
                 for(int run=1;run<=runs;run++) {
-                    long offset=0,start=System.nanoTime();int packets=0;
-                    while(offset<total) {
-                        if(cancelled)throw new IOException("上传已取消；设备可能保留部分文件");
-                        int count=(int)Math.min(chunk,total-offset);byte[] bytes=new byte[count];input.seek(offset);input.readFully(bytes);
-                        Protocol.Message response=ble.transact(tx,rx,protocol.frame(Protocol.FILE_WRITE,Protocol.fileWrite(path,offset,total,bytes,offset==0),0,1),10,Protocol.FILE,Protocol.SUCCESS);
-                        offset=Protocol.acknowledgedOffset(response,offset,count,total);packets++;
-                        double seconds=Math.max(.001,(System.nanoTime()-start)/1e9);
-                        String status=String.format(Locale.ROOT,"[%d/%d] %d / %d B · %.1f KB/s · RTT %.0f ms",run,runs,offset,total,offset/1024.0/seconds,seconds*1000/packets);
-                        updateProgress((int)(offset*100/total),status);
+                    final int runIndex=run;
+                    try(BleClient.ProtocolSession session=ble.openSession(tx,rx)) {
+                        FileUploader.upload(input,path,chunk,window,protocol,session,()->cancelled,
+                                (acknowledged,size,speed,rtt)->updateProgress((int)(acknowledged*100/size),
+                                        String.format(Locale.ROOT,"[%d/%d] %d / %d B · %.1f KB/s · RTT %.0f ms",
+                                                runIndex,runs,acknowledged,size,speed/1024.0,rtt)));
+                    } catch(Exception e) {
+                        // Other blocks may still be outstanding even after a Failure ACK.
+                        ble.disconnect(null);
+                        throw e;
                     }
                     log("上传完成 ["+run+"/"+runs+"]: "+path+" · "+total+" B");
                     if(run==runs)updateProgress(100,"上传完成 · "+runs+" 次 · 每次 "+total+" B");
@@ -297,11 +303,11 @@ public final class MainActivity extends Activity implements BleClient.Listener {
     private void runJob(String name,Job job,boolean needsConnection) {
         if(busy)throw new IllegalStateException("正在执行其他操作，请等待完成");
         if(needsConnection && !ble.isReady())throw new IllegalStateException("请先连接设备");
-        busy=true;cancelled=false;getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);connection.setText(name+"…");
+        busy=true;cancelled=false;windowSpinner.setEnabled(false);getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);connection.setText(name+"…");
         worker.execute(()->{
             try{if(!cancelled)job.run();}
             catch(Exception e){log(name+"失败: "+e.getMessage());main.post(()->{if(name.equals("Ping"))resultView.setText("Ping 失败: "+e.getMessage());else if(name.contains("文件"))progressLabel.setText(name+"失败: "+e.getMessage());});}
-            finally{main.post(()->{busy=false;if(destroyed)return;getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);connection.setText(ble.isReady()?"已连接 · MTU "+ble.mtu():"未连接");if(!ble.isReady())clearChannels();});}
+            finally{main.post(()->{busy=false;if(destroyed)return;windowSpinner.setEnabled(true);getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);connection.setText(ble.isReady()?"已连接 · MTU "+ble.mtu():"未连接");if(!ble.isReady())clearChannels();});}
         });
     }
     private void disconnect() {

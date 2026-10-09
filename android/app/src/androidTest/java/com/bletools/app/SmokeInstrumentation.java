@@ -8,6 +8,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.Spinner;
 import android.widget.TextView;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -29,6 +30,11 @@ public final class SmokeInstrumentation extends Instrumentation {
     private void present(String text) throws Exception {ui(()->{checks++;if(find(activity.getWindow().getDecorView(),text)==null)throw new AssertionError("Missing view: "+text);});}
     private void absent(String text) throws Exception {ui(()->{checks++;if(find(activity.getWindow().getDecorView(),text)!=null)throw new AssertionError("Unexpected feature: "+text);});}
     private void click(String text) throws Exception {ui(()->{View v=find(activity.getWindow().getDecorView(),text);if(!(v instanceof Button))throw new AssertionError("Missing button: "+text);v.performClick();});}
+    private Spinner findWindow(View root) {
+        if(root instanceof Spinner && "发送窗口 N".contentEquals(root.getContentDescription()==null?"":root.getContentDescription()))return (Spinner)root;
+        if(root instanceof ViewGroup)for(int i=0;i<((ViewGroup)root).getChildCount();i++){Spinner s=findWindow(((ViewGroup)root).getChildAt(i));if(s!=null)return s;}
+        return null;
+    }
     @Override public void onStart() {
         Bundle results=new Bundle();
         try {
@@ -39,12 +45,20 @@ public final class SmokeInstrumentation extends Instrumentation {
             absent("GATT");absent("设备");absent("日志");
             click("Ping");present("Ping 测试");present("尚未发送 Ping");click("发送 Ping");present("Ping 测试");
             click("文件传输");present("未选择文件");present("开始上传");click("开始上传");present("未选择文件");
+            present("发送窗口 N（最多未确认块数）");
+            ui(()->{
+                Spinner window=findWindow(activity.getWindow().getDecorView());
+                checks++;if(window==null || window.getCount()!=5 || !"2".equals(window.getSelectedItem()))throw new AssertionError("Window must default to 2 with five choices");
+                window.setSelection(4);checks++;if(!"5".equals(window.getSelectedItem()))throw new AssertionError("Window maximum 5");
+                window.setSelection(0);checks++;if(!"1".equals(window.getSelectedItem()))throw new AssertionError("Window minimum 1");
+                window.setSelection(1);
+            });
             absent("执行固件更新");absent("设备信息");absent("设置亮度");absent("重启设备");
             click("连接");present("附近的设备");click("断开连接");present("未连接");
             // Verify activity recreation, including receiver/connection cleanup.
             ui(()->activity.finish());
             activity=startActivitySync(intent);waitForIdleSync();present("BLE Tool");present("附近的设备");
-            results.putString("stream","PASS: "+checks+" UI checks (Ping/transfer navigation, removed features, input, disconnected guards, close/reopen).\n");
+            results.putString("stream","PASS: "+checks+" UI checks (Ping/transfer navigation, upload window 1-5/default 2, input, disconnected guards, close/reopen).\n");
             finish(Activity.RESULT_OK,results);
         }catch(Throwable e){results.putString("stream","FAIL: "+e+"\n");finish(Activity.RESULT_CANCELED,results);}
     }

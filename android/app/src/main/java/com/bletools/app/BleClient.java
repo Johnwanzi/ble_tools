@@ -129,42 +129,67 @@ public final class BleClient {
             subscriptions.put(key(c),mode);
         } catch(Exception e) {if(g==gatt)g.setCharacteristicNotification(c,subscription(c)!=0);throw e;}
     }
-    public Protocol.Message transact(BluetoothGattCharacteristic tx,BluetoothGattCharacteristic rx,byte[] frame,int timeout,int... expected) throws Exception {
+    /** A single inbox stays active across every frame in a file upload window. */
+    public synchronized ProtocolSession openSession(BluetoothGattCharacteristic tx,BluetoothGattCharacteristic rx) throws IOException {
+        if(!ready) throw new IOException("未连接设备");
         if(subscription(rx)==0) throw new IOException("请先订阅协议响应特征");
+        if(inbox!=null) throw new IOException("另一个协议操作正在进行");
         Inbox box=new Inbox(key(rx)); inbox=box;
-        boolean sent=false;
-        try {
+        return new ProtocolSession(tx,box);
+    }
+    public final class ProtocolSession implements FileUploader.Transport,AutoCloseable {
+        private final BluetoothGattCharacteristic tx;
+        private final Inbox box;
+        private boolean sent;
+        private ProtocolSession(BluetoothGattCharacteristic tx,Inbox box) {this.tx=tx;this.box=box;}
+        @Override public void send(byte[] frame) throws Exception {
+            if(inbox!=box || !ready) throw new IOException("协议会话已关闭");
             boolean response=(tx.getProperties()&BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)==0;
-            for(int offset=0;offset<frame.length;offset+=payloadLimit()) {
+            int fragmentSize=payloadLimit();
+            for(int offset=0;offset<frame.length;offset+=fragmentSize) {
                 sent=true;
-                write(tx,Arrays.copyOfRange(frame,offset,Math.min(frame.length,offset+payloadLimit())),response);
+                write(tx,Arrays.copyOfRange(frame,offset,Math.min(frame.length,offset+fragmentSize)),response);
             }
-            long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(timeout);
-            while(true) {
-                Object next=box.messages.poll(Math.max(0,deadline-System.nanoTime()),TimeUnit.NANOSECONDS);
-                if(next==null) {
-                    disconnect("协议响应超时，已断开连接以清除未完成请求");
-                    throw new IOException("等待设备响应超时");
+        }
+        @Override public boolean hasResponse() {return !box.messages.isEmpty();}
+        @Override public FileUploader.Response receive(long deadline) throws Exception {
+            Object next=box.messages.poll(Math.max(0,deadline-System.nanoTime()),TimeUnit.NANOSECONDS);
+            if(next instanceof Exception) throw (Exception)next;
+            return (FileUploader.Response)next;
+        }
+        @Override public void close() {synchronized(BleClient.this) {if(inbox==box)inbox=null;}}
+    }
+    public Protocol.Message transact(BluetoothGattCharacteristic tx,BluetoothGattCharacteristic rx,byte[] frame,int timeout,int... expected) throws Exception {
+        try(ProtocolSession session=openSession(tx,rx)) {
+            try {
+                session.send(frame);
+                long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(timeout);
+                while(true) {
+                    FileUploader.Response response=session.receive(deadline);
+                    if(response==null || response.arrivedAt>deadline) {
+                        disconnect("协议响应超时，已断开连接以清除未完成请求");
+                        throw new IOException("等待设备响应超时");
+                    }
+                    Protocol.Message m=response.message;
+                    if(m.type==Protocol.FAILURE) throw new IOException(Protocol.describe(m));
+                    for(int type:expected) if(m.type==type) return m;
+                    listener.log("异步协议消息: "+Protocol.describe(m));
                 }
-                if(next instanceof Exception) throw (Exception)next;
-                Protocol.Message m=(Protocol.Message)next;
-                if(m.type==Protocol.FAILURE) throw new IOException(Protocol.describe(m));
-                for(int type:expected) if(m.type==type) return m;
-                listener.log("异步协议消息: "+Protocol.describe(m));
+            } catch(Exception e) {
+                // A partially transmitted frame must never be followed by an unrelated request.
+                if(session.sent && !(e instanceof IOException && e.getMessage()!=null && e.getMessage().startsWith("Failure "))) disconnect(null);
+                throw e;
             }
-        } catch(Exception e) {
-            // A partially transmitted frame must never be followed by an unrelated request.
-            if(sent && !(e instanceof IOException && e.getMessage()!=null && e.getMessage().startsWith("Failure "))) disconnect(null);
-            throw e;
-        } finally {if(inbox==box)inbox=null;}
+        }
     }
     private void notification(BluetoothGatt g,BluetoothGattCharacteristic c,byte[] value) {
         if(g!=gatt) return;
+        long arrivedAt=System.nanoTime();
         byte[] copy=value.clone(); Inbox box=inbox;
         if(box!=null && box.key.equals(key(c))) {
             try {
                 synchronized(box) {
-                    for(Protocol.Message m:box.decoder.feed(copy)) if(!box.messages.offer(m)) {
+                    for(Protocol.Message m:box.decoder.feed(copy)) if(!box.messages.offer(new FileUploader.Response(m,arrivedAt))) {
                         box.messages.clear();box.messages.offer(new IOException("协议响应队列溢出"));break;
                     }
                 }
